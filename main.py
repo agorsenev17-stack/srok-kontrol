@@ -20,6 +20,61 @@ TOKEN = os.environ["TELEGRAM_TOKEN"]
 WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
 DATABASE_URL = os.environ["DATABASE_URL"]
 REMINDER_SECRET = os.environ.get("REMINDER_SECRET", "")
+TIMEZONE_OPTIONS = {
+    "1": ("Калининград", "Europe/Kaliningrad"),
+
+    "2": (
+        "Москва, Санкт-Петербург, Воронеж, Краснодар, Ростов-на-Дону",
+        "Europe/Moscow"
+    ),
+
+    "3": (
+        "Самара, Ижевск, Ульяновск, Саратов",
+        "Europe/Samara"
+    ),
+
+    "4": (
+        "Екатеринбург, Уфа, Пермь, Челябинск, Тюмень",
+        "Asia/Yekaterinburg"
+    ),
+
+    "5": ("Омск", "Asia/Omsk"),
+
+    "6": (
+        "Новосибирск, Барнаул, Томск, Кемерово",
+        "Asia/Novosibirsk"
+    ),
+
+    "7": (
+        "Красноярск, Абакан, Норильск, Кызыл",
+        "Asia/Krasnoyarsk"
+    ),
+
+    "8": (
+        "Иркутск, Улан-Удэ",
+        "Asia/Irkutsk"
+    ),
+
+    "9": (
+        "Якутск, Чита",
+        "Asia/Yakutsk"
+    ),
+
+    "10": (
+        "Владивосток, Хабаровск, Биробиджан",
+        "Asia/Vladivostok"
+    ),
+
+    "11": (
+        "Магадан, Южно-Сахалинск",
+        "Asia/Magadan"
+    ),
+
+    "12": (
+        "Петропавловск-Камчатский, Анадырь",
+        "Asia/Kamchatka"
+    )
+}
 
 BASE_URL = f"https://api.telegram.org/bot{TOKEN}"
 
