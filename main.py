@@ -96,11 +96,6 @@ async def telegram(method, data):
 
 
 async def send(chat_id, text):
-    """
-    Отправляет сообщения частями,
-    чтобы не превышать ограничение Telegram.
-    """
-
     max_length = 3800
 
     if len(text) <= max_length:
@@ -202,10 +197,7 @@ def load_additives():
             )
 
         except FileNotFoundError:
-            logger.warning(
-                "Файл не найден: %s",
-                filename
-            )
+            logger.warning("Файл не найден: %s", filename)
 
         except json.JSONDecodeError:
             logger.exception(
@@ -233,22 +225,13 @@ def load_additives():
 
 def normalize_search_text(text):
     text = str(text).casefold()
-
     text = text.replace("ё", "е")
-
     text = re.sub(r"\s+", " ", text)
 
     return text.strip()
 
 
 def normalize_e_codes(text):
-    """
-    Исправляет визуально похожие кириллические буквы
-    только для поиска E-номеров.
-
-    Русские названия при этом не изменяются.
-    """
-
     return text.translate(str.maketrans({
         "Е": "E",
         "е": "e",
@@ -283,11 +266,6 @@ def find_additives(text):
     found = []
 
     original_text = normalize_search_text(text)
-
-    # ----------------------------------------------
-    # 1. Поиск E-номеров
-    # ----------------------------------------------
-
     code_text = normalize_e_codes(text)
 
     codes = re.findall(
@@ -306,10 +284,6 @@ def find_additives(text):
 
         if item and item not in found:
             found.append(item)
-
-    # ----------------------------------------------
-    # 2. Поиск названий и синонимов
-    # ----------------------------------------------
 
     for item in additives.values():
 
@@ -337,9 +311,7 @@ def find_additives(text):
 
         for search_name in search_names:
 
-            search_name = normalize_search_text(
-                search_name
-            )
+            search_name = normalize_search_text(search_name)
 
             if len(search_name) < 4:
                 continue
@@ -383,7 +355,7 @@ async def check_additives(chat_id, text):
         ""
     ]
 
-    for index, item in enumerate(found[:10], 1):
+    for item in found[:10]:
 
         status = str(
             item.get("status", "yellow")
@@ -404,55 +376,20 @@ async def check_additives(chat_id, text):
             mark = "🟡"
             label = "Есть особенности или ограничения"
 
-        name = item.get(
-            "name",
-            "Неизвестное вещество"
-        )
-
-        category = item.get(
-            "category",
-            "Не указана"
-        )
-
-        purpose = item.get(
-            "purpose",
-            "Информация отсутствует"
-        )
-
-        explanation = item.get(
-            "explanation",
-            "Информация отсутствует"
-        )
-
-        risks = item.get(
-            "risks",
-            "Достоверные сведения не указаны"
-        )
-
-        effects = item.get(
-            "effects",
-            "Не указаны"
-        )
-
+        name = item.get("name", "Неизвестное вещество")
+        category = item.get("category", "Не указана")
+        purpose = item.get("purpose", "Информация отсутствует")
+        explanation = item.get("explanation", "Информация отсутствует")
+        risks = item.get("risks", "Достоверные сведения не указаны")
+        effects = item.get("effects", "Не указаны")
         who = item.get(
             "who_should_be_careful",
             "Специальные рекомендации не указаны"
         )
 
-        assessment = item.get(
-            "assessment",
-            ""
-        )
-
-        regulatory = item.get(
-            "regulatory_note",
-            ""
-        )
-
-        source = item.get(
-            "source",
-            "Источник не указан"
-        )
+        assessment = item.get("assessment", "")
+        regulatory = item.get("regulatory_note", "")
+        source = item.get("source", "Источник не указан")
 
         lines.extend([
             f"{mark} {name}",
@@ -550,9 +487,7 @@ async def setup(app):
         )
     """)
 
-    render_url = os.environ.get(
-        "RENDER_EXTERNAL_URL"
-    )
+    render_url = os.environ.get("RENDER_EXTERNAL_URL")
 
     if render_url:
 
@@ -596,7 +531,9 @@ async def start(chat_id):
         "📦 Команды:\n"
         "/add — добавить продукт\n"
         "/list — мои продукты\n"
-        "/cancel — отменить добавление\n"
+        "/edit — изменить продукт\n"
+        "/delete — удалить продукт\n"
+        "/cancel — отменить действие\n"
         "/help — помощь\n\n"
         "🔬 Проверка состава:\n"
         "Отправь E325, E621, ванилин, ментол "
@@ -604,6 +541,31 @@ async def start(chat_id):
         "🧪 Также можно искать ароматизаторы "
         "по русским и английским названиям."
     )
+
+
+# ==================================================
+# ОБЩЕЕ ПОЛУЧЕНИЕ ПРОДУКТОВ ПОЛЬЗОВАТЕЛЯ
+# ==================================================
+
+async def get_user_products(user_id):
+    return await db.fetch("""
+        SELECT id, name, expiry_date
+        FROM products
+        WHERE user_id = $1
+        ORDER BY expiry_date, id
+    """, user_id)
+
+
+def parse_product_number(text, total):
+    try:
+        number = int(text.strip())
+    except ValueError:
+        return None
+
+    if number < 1 or number > total:
+        return None
+
+    return number - 1
 
 
 # ==================================================
@@ -627,12 +589,7 @@ async def add_product(chat_id, user_id):
 
 async def show_products(chat_id, user_id):
 
-    rows = await db.fetch("""
-        SELECT name, expiry_date
-        FROM products
-        WHERE user_id = $1
-        ORDER BY expiry_date
-    """, user_id)
+    rows = await get_user_products(user_id)
 
     if not rows:
         await send(
@@ -649,15 +606,13 @@ async def show_products(chat_id, user_id):
         ""
     ]
 
-    for row in rows:
+    for index, row in enumerate(rows, 1):
 
         remaining = (
             row["expiry_date"] - today
         ).days
 
-        emoji = product_emoji(
-            row["name"]
-        )
+        emoji = product_emoji(row["name"])
 
         if remaining < 0:
             status = (
@@ -677,16 +632,19 @@ async def show_products(chat_id, user_id):
             )
 
         lines.append(
-            f"{emoji} {row['name']}\n"
+            f"**{index}.** {emoji} {row['name']}\n"
             f"📅 Дата: "
             f"{row['expiry_date'].strftime('%d.%m.%Y')}\n"
             f"{status}\n"
         )
 
-    lines.append(
+    lines.extend([
         "ℹ️ Расчёт основан на введённой дате. "
-        "Учитывай условия хранения и маркировку."
-    )
+        "Учитывай условия хранения и маркировку.",
+        "",
+        "✏️ Изменить продукт: /edit",
+        "🗑 Удалить продукт: /delete"
+    ])
 
     await send(
         chat_id,
@@ -695,22 +653,110 @@ async def show_products(chat_id, user_id):
 
 
 # ==================================================
-# ОБРАБОТКА ДОБАВЛЕНИЯ ПРОДУКТА
+# УДАЛЕНИЕ ПРОДУКТА
+# ==================================================
+
+async def start_delete(chat_id, user_id):
+
+    rows = await get_user_products(user_id)
+
+    if not rows:
+        await send(
+            chat_id,
+            "📦 Корзина пуста. Удалять пока нечего."
+        )
+        return
+
+    user_states[user_id] = {
+        "step": "delete_number"
+    }
+
+    lines = [
+        "🗑 **Удаление продукта**",
+        "",
+        "Выбери номер продукта:",
+        ""
+    ]
+
+    for index, row in enumerate(rows, 1):
+        emoji = product_emoji(row["name"])
+
+        lines.append(
+            f"{index}. {emoji} {row['name']} — "
+            f"{row['expiry_date'].strftime('%d.%m.%Y')}"
+        )
+
+    lines.extend([
+        "",
+        "Отправь номер продукта.",
+        "Для отмены: /cancel"
+    ])
+
+    await send(chat_id, "\n".join(lines))
+
+
+# ==================================================
+# РЕДАКТИРОВАНИЕ ПРОДУКТА
+# ==================================================
+
+async def start_edit(chat_id, user_id):
+
+    rows = await get_user_products(user_id)
+
+    if not rows:
+        await send(
+            chat_id,
+            "📦 Корзина пуста. Изменять пока нечего."
+        )
+        return
+
+    user_states[user_id] = {
+        "step": "edit_number"
+    }
+
+    lines = [
+        "✏️ **Редактирование продукта**",
+        "",
+        "Выбери номер продукта:",
+        ""
+    ]
+
+    for index, row in enumerate(rows, 1):
+        emoji = product_emoji(row["name"])
+
+        lines.append(
+            f"{index}. {emoji} {row['name']} — "
+            f"{row['expiry_date'].strftime('%d.%m.%Y')}"
+        )
+
+    lines.extend([
+        "",
+        "Отправь номер продукта.",
+        "Для отмены: /cancel"
+    ])
+
+    await send(chat_id, "\n".join(lines))
+
+
+# ==================================================
+# ОБРАБОТКА ТЕКСТОВЫХ ДЕЙСТВИЙ
 # ==================================================
 
 async def handle_text(chat_id, user_id, text):
 
     state = user_states.get(user_id)
 
-    # Если человек находится в процессе добавления,
-    # текст обрабатывается как название или дата.
-    # Только без активного состояния ищем добавки.
-
     if not state:
         await check_additives(chat_id, text)
         return
 
-    if state["step"] == "name":
+    step = state.get("step")
+
+    # ----------------------------------------------
+    # ДОБАВЛЕНИЕ: НАЗВАНИЕ
+    # ----------------------------------------------
+
+    if step == "name":
 
         name = text.strip()
 
@@ -737,7 +783,11 @@ async def handle_text(chat_id, user_id, text):
 
         return
 
-    if state["step"] == "date":
+    # ----------------------------------------------
+    # ДОБАВЛЕНИЕ: ДАТА
+    # ----------------------------------------------
+
+    if step == "date":
 
         try:
             expiry = datetime.strptime(
@@ -800,6 +850,272 @@ async def handle_text(chat_id, user_id, text):
             "Посмотреть корзину: /list"
         )
 
+        return
+
+    # ----------------------------------------------
+    # УДАЛЕНИЕ: ВЫБОР ПРОДУКТА
+    # ----------------------------------------------
+
+    if step == "delete_number":
+
+        rows = await get_user_products(user_id)
+
+        if not rows:
+            user_states.pop(user_id, None)
+            await send(chat_id, "📦 Корзина уже пуста.")
+            return
+
+        index = parse_product_number(text, len(rows))
+
+        if index is None:
+            await send(
+                chat_id,
+                f"❌ Введи номер от 1 до {len(rows)}."
+            )
+            return
+
+        selected = rows[index]
+
+        state["product_id"] = selected["id"]
+        state["product_name"] = selected["name"]
+        state["step"] = "delete_confirm"
+
+        await send(
+            chat_id,
+            f"🗑 Ты выбрал:\n\n"
+            f"{product_emoji(selected['name'])} "
+            f"{selected['name']}\n"
+            f"📅 Дата: "
+            f"{selected['expiry_date'].strftime('%d.%m.%Y')}\n\n"
+            "Точно удалить этот продукт?\n\n"
+            "1 — Да, удалить\n"
+            "2 — Нет, отменить"
+        )
+
+        return
+
+    # ----------------------------------------------
+    # УДАЛЕНИЕ: ПОДТВЕРЖДЕНИЕ
+    # ----------------------------------------------
+
+    if step == "delete_confirm":
+
+        answer = text.strip().casefold()
+
+        if answer in ("1", "да", "удалить"):
+
+            result = await db.execute("""
+                DELETE FROM products
+                WHERE id = $1 AND user_id = $2
+            """, state["product_id"], user_id)
+
+            user_states.pop(user_id, None)
+
+            if result == "DELETE 1":
+                await send(
+                    chat_id,
+                    f"✅ Продукт «{state['product_name']}» "
+                    "успешно удалён.\n\n"
+                    "Посмотреть корзину: /list"
+                )
+            else:
+                await send(
+                    chat_id,
+                    "⚠️ Не удалось найти этот продукт. "
+                    "Обнови список командой /list."
+                )
+
+        elif answer in ("2", "нет", "отмена"):
+            user_states.pop(user_id, None)
+
+            await send(
+                chat_id,
+                "↩️ Удаление отменено. "
+                "Продукт остался в корзине."
+            )
+
+        else:
+            await send(
+                chat_id,
+                "Выбери один вариант:\n"
+                "1 — Да, удалить\n"
+                "2 — Нет, отменить"
+            )
+
+        return
+
+    # ----------------------------------------------
+    # РЕДАКТИРОВАНИЕ: ВЫБОР ПРОДУКТА
+    # ----------------------------------------------
+
+    if step == "edit_number":
+
+        rows = await get_user_products(user_id)
+
+        if not rows:
+            user_states.pop(user_id, None)
+            await send(chat_id, "📦 Корзина уже пуста.")
+            return
+
+        index = parse_product_number(text, len(rows))
+
+        if index is None:
+            await send(
+                chat_id,
+                f"❌ Введи номер от 1 до {len(rows)}."
+            )
+            return
+
+        selected = rows[index]
+
+        state["product_id"] = selected["id"]
+        state["product_name"] = selected["name"]
+        state["step"] = "edit_choice"
+
+        await send(
+            chat_id,
+            f"✏️ Выбран продукт:\n\n"
+            f"{product_emoji(selected['name'])} "
+            f"{selected['name']}\n"
+            f"📅 Дата: "
+            f"{selected['expiry_date'].strftime('%d.%m.%Y')}\n\n"
+            "Что хочешь изменить?\n\n"
+            "1 — Название продукта\n"
+            "2 — Срок годности"
+        )
+
+        return
+
+    # ----------------------------------------------
+    # РЕДАКТИРОВАНИЕ: ВЫБОР ПОЛЯ
+    # ----------------------------------------------
+
+    if step == "edit_choice":
+
+        answer = text.strip()
+
+        if answer == "1":
+            state["step"] = "edit_name"
+
+            await send(
+                chat_id,
+                "✏️ Напиши новое название продукта:"
+            )
+
+        elif answer == "2":
+            state["step"] = "edit_date"
+
+            await send(
+                chat_id,
+                "📅 Напиши новую дату окончания "
+                "срока годности.\n\n"
+                "Формат: ДД.ММ.ГГГГ\n"
+                "Например: 25.12.2026"
+            )
+
+        else:
+            await send(
+                chat_id,
+                "❌ Выбери:\n"
+                "1 — Название\n"
+                "2 — Срок годности"
+            )
+
+        return
+
+    # ----------------------------------------------
+    # РЕДАКТИРОВАНИЕ: НОВОЕ НАЗВАНИЕ
+    # ----------------------------------------------
+
+    if step == "edit_name":
+
+        new_name = text.strip()
+
+        if not new_name or len(new_name) > 100:
+            await send(
+                chat_id,
+                "❌ Название должно содержать "
+                "от 1 до 100 символов."
+            )
+            return
+
+        result = await db.execute("""
+            UPDATE products
+            SET name = $1
+            WHERE id = $2 AND user_id = $3
+        """, new_name, state["product_id"], user_id)
+
+        user_states.pop(user_id, None)
+
+        if result == "UPDATE 1":
+            await send(
+                chat_id,
+                f"✅ Название изменено!\n\n"
+                f"{product_emoji(new_name)} {new_name}\n\n"
+                "Посмотреть корзину: /list"
+            )
+        else:
+            await send(
+                chat_id,
+                "⚠️ Не удалось изменить продукт. "
+                "Попробуй снова."
+            )
+
+        return
+
+    # ----------------------------------------------
+    # РЕДАКТИРОВАНИЕ: НОВАЯ ДАТА
+    # ----------------------------------------------
+
+    if step == "edit_date":
+
+        try:
+            new_date = datetime.strptime(
+                text.strip(),
+                "%d.%m.%Y"
+            ).date()
+
+        except ValueError:
+            await send(
+                chat_id,
+                "❌ Не удалось распознать дату.\n"
+                "Введи её в формате ДД.ММ.ГГГГ."
+            )
+            return
+
+        result = await db.execute("""
+            UPDATE products
+            SET expiry_date = $1
+            WHERE id = $2 AND user_id = $3
+        """, new_date, state["product_id"], user_id)
+
+        user_states.pop(user_id, None)
+
+        if result == "UPDATE 1":
+            await send(
+                chat_id,
+                "✅ Дата срока годности изменена!\n\n"
+                f"📅 Новая дата: "
+                f"{new_date.strftime('%d.%m.%Y')}\n\n"
+                "Посмотреть корзину: /list"
+            )
+        else:
+            await send(
+                chat_id,
+                "⚠️ Не удалось изменить продукт. "
+                "Попробуй снова."
+            )
+
+        return
+
+    user_states.pop(user_id, None)
+
+    await send(
+        chat_id,
+        "⚠️ Действие сброшено. "
+        "Попробуй начать заново."
+    )
+
 
 # ==================================================
 # ПОЛУЧЕНИЕ СООБЩЕНИЙ TELEGRAM
@@ -811,22 +1127,14 @@ async def handle(request):
         "X-Telegram-Bot-Api-Secret-Token"
     ) != WEBHOOK_SECRET:
 
-        return web.Response(
-            status=403
-        )
+        return web.Response(status=403)
 
     try:
         update = await request.json()
 
-        message = update.get(
-            "message",
-            {}
-        )
+        message = update.get("message", {})
 
-        text = message.get(
-            "text",
-            ""
-        ).strip()
+        text = message.get("text", "").strip()
 
         chat_id = message.get(
             "chat",
@@ -839,46 +1147,41 @@ async def handle(request):
         ).get("id")
 
         if not chat_id or not user_id or not text:
-            return web.json_response({
-                "ok": True
-            })
+            return web.json_response({"ok": True})
 
-        if text.startswith("/start"):
+        command = text.split()[0].split("@")[0]
 
-            user_states.pop(
-                user_id,
-                None
-            )
+        if command == "/start":
 
+            user_states.pop(user_id, None)
             await start(chat_id)
 
-        elif text.startswith("/add"):
+        elif command == "/add":
 
-            await add_product(
-                chat_id,
-                user_id
-            )
+            await add_product(chat_id, user_id)
 
-        elif text.startswith("/list"):
+        elif command == "/list":
 
-            await show_products(
-                chat_id,
-                user_id
-            )
+            await show_products(chat_id, user_id)
 
-        elif text.startswith("/cancel"):
+        elif command == "/delete":
 
-            user_states.pop(
-                user_id,
-                None
-            )
+            await start_delete(chat_id, user_id)
+
+        elif command == "/edit":
+
+            await start_edit(chat_id, user_id)
+
+        elif command == "/cancel":
+
+            user_states.pop(user_id, None)
 
             await send(
                 chat_id,
-                "❌ Добавление отменено."
+                "❌ Текущее действие отменено."
             )
 
-        elif text.startswith("/help"):
+        elif command == "/help":
 
             await send(
                 chat_id,
@@ -886,7 +1189,9 @@ async def handle(request):
                 "/start — запуск бота\n"
                 "/add — добавить продукт\n"
                 "/list — посмотреть продукты\n"
-                "/cancel — отменить добавление\n"
+                "/edit — изменить продукт\n"
+                "/delete — удалить продукт\n"
+                "/cancel — отменить действие\n"
                 "/help — помощь\n\n"
                 "🔬 Для проверки состава отправь "
                 "E325, E621, ванилин, ментол "
@@ -901,19 +1206,13 @@ async def handle(request):
                 text
             )
 
-        return web.json_response({
-            "ok": True
-        })
+        return web.json_response({"ok": True})
 
     except Exception:
 
-        logger.exception(
-            "Ошибка обработки сообщения"
-        )
+        logger.exception("Ошибка обработки сообщения")
 
-        return web.json_response({
-            "ok": True
-        })
+        return web.json_response({"ok": True})
 
 
 # ==================================================
@@ -934,15 +1233,8 @@ async def health(request):
 
 app = web.Application()
 
-app.router.add_post(
-    "/webhook",
-    handle
-)
-
-app.router.add_get(
-    "/",
-    health
-)
+app.router.add_post("/webhook", handle)
+app.router.add_get("/", health)
 
 app.on_startup.append(setup)
 app.on_cleanup.append(cleanup)
