@@ -639,6 +639,29 @@ def parse_product_number(text, total):
         return None
 
     return number - 1
+    async def start_timezone(chat_id, user_id):
+
+    user_states[user_id] = {
+        "step": "timezone_choice"
+    }
+
+    lines = [
+        "🌍 Выбери свой город или часовой пояс:",
+        "",
+    ]
+
+    for number, (cities, timezone) in TIMEZONE_OPTIONS.items():
+        lines.append(f"{number} — {cities}")
+
+    lines.extend([
+        "",
+        "Отправь номер своего варианта.",
+        "",
+        "⏰ Напоминания будут приходить в 09:00 по выбранному времени.",
+        "Для отмены: /cancel"
+    ])
+
+    await send(chat_id, "\n".join(lines))
 
 
 # ==================================================
