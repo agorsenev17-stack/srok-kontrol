@@ -847,6 +847,53 @@ async def handle_text(chat_id, user_id, text):
         return
 
     step = state.get("step")
+        # ----------------------------------------------
+    # ВЫБОР ЧАСОВОГО ПОЯСА
+    # ----------------------------------------------
+
+    if step == "timezone_choice":
+
+        choice = text.strip()
+
+        if choice not in TIMEZONE_OPTIONS:
+            await send(
+                chat_id,
+                "❌ Такого номера нет. "
+                "Выбери номер из списка или отправь /cancel."
+            )
+            return
+
+        cities, timezone = TIMEZONE_OPTIONS[choice]
+
+        try:
+            ZoneInfo(timezone)
+        except Exception:
+            logger.exception("Некорректный часовой пояс: %s", timezone)
+            await send(chat_id, "⚠️ Не удалось установить часовой пояс. Попробуй позже.")
+            return
+
+        await db.execute("""
+            INSERT INTO user_settings (
+                user_id,
+                timezone,
+                reminder_hour
+            )
+            VALUES ($1, $2, 9)
+            ON CONFLICT (user_id)
+            DO UPDATE SET timezone = EXCLUDED.timezone
+        """, user_id, timezone)
+
+        user_states.pop(user_id, None)
+
+        await send(
+            chat_id,
+            f"✅ Часовой пояс сохранён!\n\n"
+            f"📍 Регион: {cities}\n"
+            f"🌍 Часовой пояс: {timezone}\n"
+            f"⏰ Время напоминаний: 09:00\n\n"
+            "Теперь можно пользоваться ботом."
+        )
+        return
 
     # ----------------------------------------------
     # ДОБАВЛЕНИЕ: НАЗВАНИЕ
