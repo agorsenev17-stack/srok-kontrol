@@ -82,22 +82,70 @@ async def send(chat_id, text):
 
 # Загрузка справочника добавок
 def load_additives():
+
+# Загрузка объединённого справочника добавок и ароматизаторов
+def load_additives():
     global additives
 
-    file_path = Path(__file__).with_name("additives.json")
+    base_path = Path(__file__).parent
 
-    try:
-        with open(file_path, "r", encoding="utf-8") as file:
-            additives = json.load(file)
+    files = [
+        "additives.json",
+        "additives_extra.json",
+        "flavourings.json"
+    ]
 
-        if not isinstance(additives, dict):
-            raise ValueError("Неверный формат additives.json")
+    combined = {}
 
-        logger.info("Загружено добавок: %s", len(additives))
+    for filename in files:
+        file_path = base_path / filename
 
-    except Exception:
-        additives = {}
-        logger.exception("Не удалось загрузить additives.json")
+        try:
+            with open(file_path, "r", encoding="utf-8") as file:
+                data = json.load(file)
+
+            if not isinstance(data, dict):
+                raise ValueError(f"Неверный формат файла {filename}")
+
+            for code, information in data.items():
+                if not isinstance(information, dict):
+                    logger.warning(
+                        "Пропущена некорректная запись %s в %s",
+                        code, filename
+                    )
+                    continue
+
+                normalized_code = str(code).strip().upper()
+
+                if normalized_code in combined:
+                    logger.warning(
+                        "Повторяющийся код %s из файла %s",
+                        normalized_code, filename
+                    )
+
+                combined[normalized_code] = information
+
+            logger.info(
+                "Загружен файл %s: %s записей",
+                filename, len(data)
+            )
+
+        except FileNotFoundError:
+            logger.warning("Файл не найден: %s", filename)
+
+        except Exception:
+            logger.exception(
+                "Ошибка загрузки файла %s",
+                filename
+            )
+
+    additives = combined
+
+    logger.info(
+        "Всего загружено записей справочника: %s",
+        len(additives)
+    )
+
 
 
 # Поиск добавок по E-номерам и названиям
