@@ -19,6 +19,7 @@ from aiohttp import web, ClientSession
 TOKEN = os.environ["TELEGRAM_TOKEN"]
 WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
 DATABASE_URL = os.environ["DATABASE_URL"]
+REMINDER_SECRET = os.environ.get("REMINDER_SECRET", "")
 
 BASE_URL = f"https://api.telegram.org/bot{TOKEN}"
 
