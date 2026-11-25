@@ -10,6 +10,11 @@ from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 import asyncpg
 from aiohttp import web, ClientSession
 
+
+# ==================================================
+# НАСТРОЙКИ
+# ==================================================
+
 TOKEN = os.environ["TELEGRAM_TOKEN"]
 WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
 DATABASE_URL = os.environ["DATABASE_URL"]
@@ -21,11 +26,15 @@ logger = logging.getLogger(__name__)
 
 db = None
 http = None
+
 user_states = {}
 additives = {}
 
 
-# Эмодзи для разных продуктов
+# ==================================================
+# ЭМОДЗИ ДЛЯ ПРОДУКТОВ
+# ==================================================
+
 def product_emoji(name):
     name = name.casefold()
 
@@ -65,25 +74,78 @@ def product_emoji(name):
     return "🥫"
 
 
+# ==================================================
+# TELEGRAM
+# ==================================================
+
 async def telegram(method, data):
     async with http.post(
         f"{BASE_URL}/{method}",
         json=data
     ) as response:
-        return await response.json()
+        result = await response.json()
+
+        if not result.get("ok"):
+            logger.error(
+                "Ошибка Telegram API (%s): %s",
+                method,
+                result
+            )
+
+        return result
 
 
 async def send(chat_id, text):
-    await telegram("sendMessage", {
-        "chat_id": chat_id,
-        "text": text
-    })
+    """
+    Отправляет сообщения частями,
+    чтобы не превышать ограничение Telegram.
+    """
+
+    max_length = 3800
+
+    if len(text) <= max_length:
+        await telegram("sendMessage", {
+            "chat_id": chat_id,
+            "text": text
+        })
+        return
+
+    chunks = []
+    current = ""
+
+    for line in text.split("\n"):
+        if len(current) + len(line) + 1 > max_length:
+            if current:
+                chunks.append(current)
+                current = ""
+
+        while len(line) > max_length:
+            if current:
+                chunks.append(current)
+                current = ""
+
+            chunks.append(line[:max_length])
+            line = line[max_length:]
+
+        if current:
+            current += "\n" + line
+        else:
+            current = line
+
+    if current:
+        chunks.append(current)
+
+    for chunk in chunks:
+        await telegram("sendMessage", {
+            "chat_id": chat_id,
+            "text": chunk
+        })
 
 
-# Загрузка справочника добавок
-def load_additives():
+# ==================================================
+# ЗАГРУЗКА ТРЁХ СПРАВОЧНИКОВ
+# ==================================================
 
-# Загрузка объединённого справочника добавок и ароматизаторов
 def load_additives():
     global additives
 
@@ -105,13 +167,19 @@ def load_additives():
                 data = json.load(file)
 
             if not isinstance(data, dict):
-                raise ValueError(f"Неверный формат файла {filename}")
+                raise ValueError(
+                    f"Неверный формат файла {filename}"
+                )
+
+            loaded_count = 0
 
             for code, information in data.items():
+
                 if not isinstance(information, dict):
                     logger.warning(
                         "Пропущена некорректная запись %s в %s",
-                        code, filename
+                        code,
+                        filename
                     )
                     continue
 
@@ -120,18 +188,30 @@ def load_additives():
                 if normalized_code in combined:
                     logger.warning(
                         "Повторяющийся код %s из файла %s",
-                        normalized_code, filename
+                        normalized_code,
+                        filename
                     )
 
                 combined[normalized_code] = information
+                loaded_count += 1
 
             logger.info(
                 "Загружен файл %s: %s записей",
-                filename, len(data)
+                filename,
+                loaded_count
             )
 
         except FileNotFoundError:
-            logger.warning("Файл не найден: %s", filename)
+            logger.warning(
+                "Файл не найден: %s",
+                filename
+            )
+
+        except json.JSONDecodeError:
+            logger.exception(
+                "Ошибка JSON в файле %s",
+                filename
+            )
 
         except Exception:
             logger.exception(
@@ -147,13 +227,29 @@ def load_additives():
     )
 
 
+# ==================================================
+# НОРМАЛИЗАЦИЯ ТЕКСТА
+# ==================================================
 
-# Поиск добавок по E-номерам и названиям
-def find_additives(text):
-    found = []
+def normalize_search_text(text):
+    text = str(text).casefold()
 
-    # Заменяем похожие русские буквы латинскими
-    text = text.translate(str.maketrans({
+    text = text.replace("ё", "е")
+
+    text = re.sub(r"\s+", " ", text)
+
+    return text.strip()
+
+
+def normalize_e_codes(text):
+    """
+    Исправляет визуально похожие кириллические буквы
+    только для поиска E-номеров.
+
+    Русские названия при этом не изменяются.
+    """
+
+    return text.translate(str.maketrans({
         "Е": "E",
         "е": "e",
         "А": "A",
@@ -178,30 +274,89 @@ def find_additives(text):
         "х": "x"
     }))
 
+
+# ==================================================
+# ПОИСК ДОБАВОК И АРОМАТИЗАТОРОВ
+# ==================================================
+
+def find_additives(text):
+    found = []
+
+    original_text = normalize_search_text(text)
+
+    # ----------------------------------------------
+    # 1. Поиск E-номеров
+    # ----------------------------------------------
+
+    code_text = normalize_e_codes(text)
+
     codes = re.findall(
         r"(?i)\bE\s*-?\s*\d{3,4}[a-z]?\b",
-        text
+        code_text
     )
 
     for code in codes:
-        normalized = re.sub(r"[\s-]", "", code).upper()
+        normalized = re.sub(
+            r"[\s-]",
+            "",
+            code
+        ).upper()
 
-        for key, item in additives.items():
-            if key.upper() == normalized:
+        item = additives.get(normalized)
+
+        if item and item not in found:
+            found.append(item)
+
+    # ----------------------------------------------
+    # 2. Поиск названий и синонимов
+    # ----------------------------------------------
+
+    for item in additives.values():
+
+        if not isinstance(item, dict):
+            continue
+
+        search_names = []
+
+        name = item.get("name", "")
+
+        if isinstance(name, str) and name:
+            search_names.append(name)
+
+        aliases = item.get("aliases", [])
+
+        if isinstance(aliases, list):
+            search_names.extend(
+                alias
+                for alias in aliases
+                if isinstance(alias, str)
+            )
+
+        elif isinstance(aliases, str):
+            search_names.append(aliases)
+
+        for search_name in search_names:
+
+            search_name = normalize_search_text(
+                search_name
+            )
+
+            if len(search_name) < 4:
+                continue
+
+            if search_name in original_text:
+
                 if item not in found:
                     found.append(item)
 
-    lower_text = text.casefold()
-
-    for item in additives.values():
-        name = item.get("name", "").casefold()
-
-        if len(name) >= 5 and name in lower_text:
-            if item not in found:
-                found.append(item)
+                break
 
     return found
 
+
+# ==================================================
+# КАРТОЧКИ ДОБАВОК И АРОМАТИЗАТОРОВ
+# ==================================================
 
 async def check_additives(chat_id, text):
     found = find_additives(text)
@@ -211,47 +366,154 @@ async def check_additives(chat_id, text):
             chat_id,
             "🔎 В нашем справочнике пока не найдены "
             "известные добавки из этого текста.\n\n"
-            "Попробуй отправить E325, E621 "
-            "или название добавки.\n\n"
-            "Отсутствие результата не означает, "
+            "Попробуй отправить:\n"
+            "• E325\n"
+            "• E621\n"
+            "• Ванилин\n"
+            "• Ментол\n"
+            "• Лимонен\n\n"
+            "Также можно отправить английское название.\n\n"
+            "ℹ️ Отсутствие результата не означает, "
             "что продукт опасен или запрещён."
         )
         return
 
-    lines = ["🔬 Результаты проверки:\n"]
+    lines = [
+        f"🔬 Найдено записей: {len(found)}",
+        ""
+    ]
 
-    for item in found[:10]:
-        status = item.get("status", "yellow")
+    for index, item in enumerate(found[:10], 1):
+
+        status = str(
+            item.get("status", "yellow")
+        ).lower()
 
         if status == "green":
             mark = "🟢"
-            label = "Обычно не вызывает опасений при разрешённом применении"
+            label = (
+                "Нет оснований для опасений "
+                "при оценённых условиях применения"
+            )
+
         elif status == "red":
             mark = "🔴"
             label = "Требует особого внимания"
+
         else:
             mark = "🟡"
             label = "Есть особенности или ограничения"
 
-        lines.append(
-            f"{mark} {item.get('name', 'Неизвестная добавка')}\n"
-            f"Категория: {item.get('category', 'Не указана')}\n"
-            f"Оценка: {label}\n"
-            f"Назначение: {item.get('purpose', 'Не указано')}\n"
-            f"Описание: {item.get('explanation', 'Нет описания')}\n"
-            f"Возможные риски: {item.get('risks', 'Нет данных')}\n"
+        name = item.get(
+            "name",
+            "Неизвестное вещество"
         )
 
-    lines.append(
-        "ℹ️ Это справочная информация, а не заключение "
-        "о безопасности продукта. Важны количество добавки, "
-        "категория продукта и условия её применения."
-    )
+        category = item.get(
+            "category",
+            "Не указана"
+        )
+
+        purpose = item.get(
+            "purpose",
+            "Информация отсутствует"
+        )
+
+        explanation = item.get(
+            "explanation",
+            "Информация отсутствует"
+        )
+
+        risks = item.get(
+            "risks",
+            "Достоверные сведения не указаны"
+        )
+
+        effects = item.get(
+            "effects",
+            "Не указаны"
+        )
+
+        who = item.get(
+            "who_should_be_careful",
+            "Специальные рекомендации не указаны"
+        )
+
+        assessment = item.get(
+            "assessment",
+            ""
+        )
+
+        regulatory = item.get(
+            "regulatory_note",
+            ""
+        )
+
+        source = item.get(
+            "source",
+            "Источник не указан"
+        )
+
+        lines.extend([
+            f"{mark} {name}",
+            f"Категория: {category}",
+            f"Оценка: {label}",
+            "",
+            f"🎯 Назначение:\n{purpose}",
+            "",
+            f"📖 Что это такое:\n{explanation}",
+            "",
+            f"⚠️ Возможные риски:\n{risks}",
+            "",
+            f"🧬 Воздействие:\n{effects}",
+            "",
+            f"👤 Кому стоит обратить внимание:\n{who}",
+        ])
+
+        if assessment:
+            lines.extend([
+                "",
+                f"📋 Научная оценка:\n{assessment}"
+            ])
+
+        if regulatory:
+            lines.extend([
+                "",
+                f"⚖️ Регуляторная информация:\n{regulatory}"
+            ])
+
+        lines.extend([
+            "",
+            f"📚 Источник: {source}",
+            "",
+            "━━━━━━━━━━━━━━",
+            ""
+        ])
+
+    if len(found) > 10:
+        lines.append(
+            f"ℹ️ Показаны первые 10 записей из {len(found)}."
+        )
+
+    lines.extend([
+        "",
+        "❗ ВАЖНО:",
+        "Эта проверка носит справочный характер.",
+        "Наличие вещества само по себе не доказывает, "
+        "что продукт опасен.",
+        "Важны количество вещества, категория продукта, "
+        "условия применения и индивидуальная чувствительность.",
+        "",
+        "🛒 Для проверки срока годности используй /add."
+    ])
 
     await send(chat_id, "\n".join(lines))
 
 
-# Подключение базы данных и Telegram
+# ==================================================
+# ПОДКЛЮЧЕНИЕ NEON И TELEGRAM WEBHOOK
+# ==================================================
+
 async def setup(app):
     global db, http
 
@@ -288,9 +550,12 @@ async def setup(app):
         )
     """)
 
-    render_url = os.environ.get("RENDER_EXTERNAL_URL")
+    render_url = os.environ.get(
+        "RENDER_EXTERNAL_URL"
+    )
 
     if render_url:
+
         result = await telegram("setWebhook", {
             "url": f"{render_url}/webhook",
             "secret_token": WEBHOOK_SECRET,
@@ -300,10 +565,17 @@ async def setup(app):
         if result.get("ok"):
             logger.info("Webhook подключён")
         else:
-            logger.error("Ошибка подключения Webhook: %s", result)
+            logger.error(
+                "Ошибка подключения Webhook: %s",
+                result
+            )
+
+    logger.info("СрокКонтроль успешно запущен")
 
 
 async def cleanup(app):
+    global db, http
+
     if db:
         await db.close()
 
@@ -311,25 +583,37 @@ async def cleanup(app):
         await http.close()
 
 
-# Стартовое сообщение
+# ==================================================
+# СТАРТ
+# ==================================================
+
 async def start(chat_id):
     await send(
         chat_id,
         "🥫 Добро пожаловать в СрокКонтроль!\n\n"
         "Я помогу следить за сроками годности "
         "и разбираться в составе продуктов.\n\n"
-        "Команды:\n"
+        "📦 Команды:\n"
         "/add — добавить продукт\n"
         "/list — мои продукты\n"
+        "/cancel — отменить добавление\n"
         "/help — помощь\n\n"
-        "🔬 Для проверки добавки отправь её номер, "
-        "например E325 или E621."
+        "🔬 Проверка состава:\n"
+        "Отправь E325, E621, ванилин, ментол "
+        "или название другого вещества.\n\n"
+        "🧪 Также можно искать ароматизаторы "
+        "по русским и английским названиям."
     )
 
 
-# Добавление продукта
+# ==================================================
+# ДОБАВЛЕНИЕ ПРОДУКТА
+# ==================================================
+
 async def add_product(chat_id, user_id):
-    user_states[user_id] = {"step": "name"}
+    user_states[user_id] = {
+        "step": "name"
+    }
 
     await send(
         chat_id,
@@ -337,8 +621,12 @@ async def add_product(chat_id, user_id):
     )
 
 
-# Просмотр корзины
+# ==================================================
+# ПРОСМОТР КОРЗИНЫ
+# ==================================================
+
 async def show_products(chat_id, user_id):
+
     rows = await db.fetch("""
         SELECT name, expiry_date
         FROM products
@@ -347,50 +635,90 @@ async def show_products(chat_id, user_id):
     """, user_id)
 
     if not rows:
-        await send(chat_id, "Твоя корзина пока пуста.")
+        await send(
+            chat_id,
+            "📦 Твоя корзина пока пуста.\n\n"
+            "Добавить продукт: /add"
+        )
         return
 
     today = date.today()
-    lines = ["📦 Твои продукты:\n"]
+
+    lines = [
+        "📦 Твои продукты:",
+        ""
+    ]
 
     for row in rows:
-        remaining = (row["expiry_date"] - today).days
-        emoji = product_emoji(row["name"])
+
+        remaining = (
+            row["expiry_date"] - today
+        ).days
+
+        emoji = product_emoji(
+            row["name"]
+        )
 
         if remaining < 0:
             status = (
                 "⚠️ Срок годности истёк. "
                 "Не рекомендуется употреблять."
             )
+
         elif remaining == 0:
-            status = "⚠️ Сегодня последний день по указанной дате."
+            status = (
+                "⚠️ Сегодня последний день "
+                "по указанной дате."
+            )
+
         else:
-            status = f"Осталось дней: {remaining}"
+            status = (
+                f"⏳ Осталось дней: {remaining}"
+            )
 
         lines.append(
             f"{emoji} {row['name']}\n"
-            f"📅 Дата: {row['expiry_date'].strftime('%d.%m.%Y')}\n"
+            f"📅 Дата: "
+            f"{row['expiry_date'].strftime('%d.%m.%Y')}\n"
             f"{status}\n"
         )
 
-    await send(chat_id, "\n".join(lines))
+    lines.append(
+        "ℹ️ Расчёт основан на введённой дате. "
+        "Учитывай условия хранения и маркировку."
+    )
+
+    await send(
+        chat_id,
+        "\n".join(lines)
+    )
 
 
-# Обработка добавления продукта
+# ==================================================
+# ОБРАБОТКА ДОБАВЛЕНИЯ ПРОДУКТА
+# ==================================================
+
 async def handle_text(chat_id, user_id, text):
+
     state = user_states.get(user_id)
+
+    # Если человек находится в процессе добавления,
+    # текст обрабатывается как название или дата.
+    # Только без активного состояния ищем добавки.
 
     if not state:
         await check_additives(chat_id, text)
         return
 
     if state["step"] == "name":
+
         name = text.strip()
 
         if not name or len(name) > 100:
             await send(
                 chat_id,
-                "❌ Название должно содержать от 1 до 100 символов."
+                "❌ Название должно содержать "
+                "от 1 до 100 символов."
             )
             return
 
@@ -402,12 +730,15 @@ async def handle_text(chat_id, user_id, text):
         await send(
             chat_id,
             f"{emoji} Продукт: {name}\n\n"
-            "📅 Теперь введи дату окончания срока годности.\n\n"
+            "📅 Теперь введи дату окончания "
+            "срока годности.\n\n"
             "Например: 25.12.2026"
         )
+
         return
 
     if state["step"] == "date":
+
         try:
             expiry = datetime.strptime(
                 text.strip(),
@@ -425,103 +756,206 @@ async def handle_text(chat_id, user_id, text):
         name = state["name"]
 
         await db.execute("""
-            INSERT INTO products (user_id, name, expiry_date)
+            INSERT INTO products (
+                user_id,
+                name,
+                expiry_date
+            )
             VALUES ($1, $2, $3)
         """, user_id, name, expiry)
 
         user_states.pop(user_id, None)
 
-        remaining = (expiry - date.today()).days
+        remaining = (
+            expiry - date.today()
+        ).days
+
         emoji = product_emoji(name)
 
         if remaining < 0:
             status = (
-                "⚠️ Срок годности истёк.\n"
-                "Не рекомендуется употреблять продукт. "
-                "Не пробуй его, даже если запах и внешний вид нормальные."
+                "⚠️ Указанная дата уже прошла.\n"
+                "Не рекомендуется употреблять продукт."
             )
+
         elif remaining == 0:
             status = (
-                "⚠️ Сегодня последний день по указанной дате."
+                "⚠️ Сегодня последний день "
+                "по указанной дате."
             )
+
         else:
-            status = f"По указанной дате осталось {remaining} дн."
+            status = (
+                f"⏳ По указанной дате осталось "
+                f"{remaining} дн."
+            )
 
         await send(
             chat_id,
             f"✅ Продукт добавлен!\n\n"
             f"{emoji} {name}\n"
-            f"📅 Годен до: {expiry.strftime('%d.%m.%Y')}\n\n"
+            f"📅 Годен до: "
+            f"{expiry.strftime('%d.%m.%Y')}\n\n"
             f"{status}\n\n"
-            f"Посмотреть корзину: /list"
+            "Посмотреть корзину: /list"
         )
 
 
-# Получение сообщений Telegram
+# ==================================================
+# ПОЛУЧЕНИЕ СООБЩЕНИЙ TELEGRAM
+# ==================================================
+
 async def handle(request):
+
     if request.headers.get(
         "X-Telegram-Bot-Api-Secret-Token"
     ) != WEBHOOK_SECRET:
-        return web.Response(status=403)
+
+        return web.Response(
+            status=403
+        )
 
     try:
         update = await request.json()
-        message = update.get("message", {})
 
-        text = message.get("text", "").strip()
-        chat_id = message.get("chat", {}).get("id")
-        user_id = message.get("from", {}).get("id")
+        message = update.get(
+            "message",
+            {}
+        )
+
+        text = message.get(
+            "text",
+            ""
+        ).strip()
+
+        chat_id = message.get(
+            "chat",
+            {}
+        ).get("id")
+
+        user_id = message.get(
+            "from",
+            {}
+        ).get("id")
 
         if not chat_id or not user_id or not text:
-            return web.json_response({"ok": True})
+            return web.json_response({
+                "ok": True
+            })
 
         if text.startswith("/start"):
-            user_states.pop(user_id, None)
+
+            user_states.pop(
+                user_id,
+                None
+            )
+
             await start(chat_id)
 
         elif text.startswith("/add"):
-            await add_product(chat_id, user_id)
+
+            await add_product(
+                chat_id,
+                user_id
+            )
 
         elif text.startswith("/list"):
-            await show_products(chat_id, user_id)
+
+            await show_products(
+                chat_id,
+                user_id
+            )
 
         elif text.startswith("/cancel"):
-            user_states.pop(user_id, None)
-            await send(chat_id, "Добавление отменено.")
+
+            user_states.pop(
+                user_id,
+                None
+            )
+
+            await send(
+                chat_id,
+                "❌ Добавление отменено."
+            )
 
         elif text.startswith("/help"):
+
             await send(
                 chat_id,
                 "📖 Помощь\n\n"
+                "/start — запуск бота\n"
                 "/add — добавить продукт\n"
                 "/list — посмотреть продукты\n"
-                "/cancel — отменить добавление\n\n"
-                "🔬 Отправь E325, E621 или название добавки, "
-                "чтобы проверить её."
+                "/cancel — отменить добавление\n"
+                "/help — помощь\n\n"
+                "🔬 Для проверки состава отправь "
+                "E325, E621, ванилин, ментол "
+                "или английское название вещества."
             )
 
         else:
-            await handle_text(chat_id, user_id, text)
 
-        return web.json_response({"ok": True})
+            await handle_text(
+                chat_id,
+                user_id,
+                text
+            )
+
+        return web.json_response({
+            "ok": True
+        })
 
     except Exception:
-        logger.exception("Ошибка обработки сообщения")
-        return web.json_response({"ok": True})
 
+        logger.exception(
+            "Ошибка обработки сообщения"
+        )
+
+        return web.json_response({
+            "ok": True
+        })
+
+
+# ==================================================
+# ПРОВЕРКА РАБОТОСПОСОБНОСТИ RENDER
+# ==================================================
 
 async def health(request):
-    return web.json_response({"status": "ok"})
+    return web.json_response({
+        "status": "ok",
+        "service": "СрокКонтроль",
+        "additives_loaded": len(additives)
+    })
 
+
+# ==================================================
+# ЗАПУСК ПРИЛОЖЕНИЯ
+# ==================================================
 
 app = web.Application()
-app.router.add_post("/webhook", handle)
-app.router.add_get("/", health)
+
+app.router.add_post(
+    "/webhook",
+    handle
+)
+
+app.router.add_get(
+    "/",
+    health
+)
 
 app.on_startup.append(setup)
 app.on_cleanup.append(cleanup)
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    web.run_app(app, host="0.0.0.0", port=port)
+
+    port = int(
+        os.environ.get("PORT", 10000)
+    )
+
+    web.run_app(
+        app,
+        host="0.0.0.0",
+        port=port
+    )
