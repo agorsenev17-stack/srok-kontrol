@@ -4,7 +4,7 @@ import re
 import json
 import logging
 from pathlib import Path
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
@@ -20,63 +20,41 @@ TOKEN = os.environ["TELEGRAM_TOKEN"]
 WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
 DATABASE_URL = os.environ["DATABASE_URL"]
 REMINDER_SECRET = os.environ.get("REMINDER_SECRET", "")
+
+BASE_URL = f"https://api.telegram.org/bot{TOKEN}"
+
 TIMEZONE_OPTIONS = {
     "1": ("Калининград", "Europe/Kaliningrad"),
-
     "2": (
         "Москва, Санкт-Петербург, Воронеж, Краснодар, Ростов-на-Дону",
         "Europe/Moscow"
     ),
-
-    "3": (
-        "Самара, Ижевск, Ульяновск, Саратов",
-        "Europe/Samara"
-    ),
-
+    "3": ("Самара, Ижевск, Ульяновск, Саратов", "Europe/Samara"),
     "4": (
         "Екатеринбург, Уфа, Пермь, Челябинск, Тюмень",
         "Asia/Yekaterinburg"
     ),
-
     "5": ("Омск", "Asia/Omsk"),
-
     "6": (
         "Новосибирск, Барнаул, Томск, Кемерово",
         "Asia/Novosibirsk"
     ),
-
     "7": (
         "Красноярск, Абакан, Норильск, Кызыл",
         "Asia/Krasnoyarsk"
     ),
-
-    "8": (
-        "Иркутск, Улан-Удэ",
-        "Asia/Irkutsk"
-    ),
-
-    "9": (
-        "Якутск, Чита",
-        "Asia/Yakutsk"
-    ),
-
+    "8": ("Иркутск, Улан-Удэ", "Asia/Irkutsk"),
+    "9": ("Якутск, Чита", "Asia/Yakutsk"),
     "10": (
         "Владивосток, Хабаровск, Биробиджан",
         "Asia/Vladivostok"
     ),
-
-    "11": (
-        "Магадан, Южно-Сахалинск",
-        "Asia/Magadan"
-    ),
-
+    "11": ("Магадан, Южно-Сахалинск", "Asia/Magadan"),
     "12": (
         "Петропавловск-Камчатский, Анадырь",
         "Asia/Kamchatka"
     )
 }
-
-BASE_URL = f"https://api.telegram.org/bot{TOKEN}"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -195,7 +173,7 @@ async def send(chat_id, text):
 
 
 # ==================================================
-# ЗАГРУЗКА ТРЁХ СПРАВОЧНИКОВ
+# ЗАГРУЗКА СПРАВОЧНИКОВ
 # ==================================================
 
 def load_additives():
@@ -226,7 +204,6 @@ def load_additives():
             loaded_count = 0
 
             for code, information in data.items():
-
                 if not isinstance(information, dict):
                     logger.warning(
                         "Пропущена некорректная запись %s в %s",
@@ -343,7 +320,6 @@ def find_additives(text):
             found.append(item)
 
     for item in additives.values():
-
         if not isinstance(item, dict):
             continue
 
@@ -367,14 +343,12 @@ def find_additives(text):
             search_names.append(aliases)
 
         for search_name in search_names:
-
             search_name = normalize_search_text(search_name)
 
             if len(search_name) < 4:
                 continue
 
             if search_name in original_text:
-
                 if item not in found:
                     found.append(item)
 
@@ -413,7 +387,6 @@ async def check_additives(chat_id, text):
     ]
 
     for item in found[:10]:
-
         status = str(
             item.get("status", "yellow")
         ).lower()
@@ -424,11 +397,9 @@ async def check_additives(chat_id, text):
                 "Нет оснований для опасений "
                 "при оценённых условиях применения"
             )
-
         elif status == "red":
             mark = "🔴"
             label = "Требует особого внимания"
-
         else:
             mark = "🟡"
             label = "Есть особенности или ограничения"
@@ -545,25 +516,16 @@ async def setup(app):
     """)
 
     await db.execute("""
-    CREATE TABLE IF NOT EXISTS user_settings (
-        user_id BIGINT PRIMARY KEY,
-        timezone TEXT NOT NULL DEFAULT 'Europe/Moscow',
-        reminder_hour INTEGER NOT NULL DEFAULT 9
-    )
-""")
-    
-    await db.execute("""
-    CREATE TABLE IF NOT EXISTS user_settings (
-        user_id BIGINT PRIMARY KEY,
-        timezone TEXT NOT NULL DEFAULT 'Europe/Moscow',
-        reminder_hour INTEGER NOT NULL DEFAULT 9
-    )
-""")
+        CREATE TABLE IF NOT EXISTS user_settings (
+            user_id BIGINT PRIMARY KEY,
+            timezone TEXT NOT NULL DEFAULT 'Europe/Moscow',
+            reminder_hour INTEGER NOT NULL DEFAULT 9
+        )
+    """)
 
     render_url = os.environ.get("RENDER_EXTERNAL_URL")
 
     if render_url:
-
         result = await telegram("setWebhook", {
             "url": f"{render_url}/webhook",
             "secret_token": WEBHOOK_SECRET,
@@ -618,6 +580,35 @@ async def start(chat_id):
 
 
 # ==================================================
+# ЧАСОВОЙ ПОЯС
+# ==================================================
+
+async def start_timezone(chat_id, user_id):
+    user_states[user_id] = {
+        "step": "timezone_choice"
+    }
+
+    lines = [
+        "🌍 Выбери свой город или часовой пояс:",
+        ""
+    ]
+
+    for number, (cities, timezone) in TIMEZONE_OPTIONS.items():
+        lines.append(f"{number} — {cities}")
+
+    lines.extend([
+        "",
+        "Отправь номер своего варианта.",
+        "",
+        "⏰ В дальнейшем напоминания будут приходить "
+        "в 09:00 по выбранному времени.",
+        "Для отмены: /cancel"
+    ])
+
+    await send(chat_id, "\n".join(lines))
+
+
+# ==================================================
 # ОБЩЕЕ ПОЛУЧЕНИЕ ПРОДУКТОВ ПОЛЬЗОВАТЕЛЯ
 # ==================================================
 
@@ -640,29 +631,6 @@ def parse_product_number(text, total):
         return None
 
     return number - 1
-    async def start_timezone(chat_id, user_id):
-
-    user_states[user_id] = {
-        "step": "timezone_choice"
-    }
-
-    lines = [
-        "🌍 Выбери свой город или часовой пояс:",
-        "",
-    ]
-
-    for number, (cities, timezone) in TIMEZONE_OPTIONS.items():
-        lines.append(f"{number} — {cities}")
-
-    lines.extend([
-        "",
-        "Отправь номер своего варианта.",
-        "",
-        "⏰ Напоминания будут приходить в 09:00 по выбранному времени.",
-        "Для отмены: /cancel"
-    ])
-
-    await send(chat_id, "\n".join(lines))
 
 
 # ==================================================
@@ -685,7 +653,6 @@ async def add_product(chat_id, user_id):
 # ==================================================
 
 async def show_products(chat_id, user_id):
-
     rows = await get_user_products(user_id)
 
     if not rows:
@@ -704,7 +671,6 @@ async def show_products(chat_id, user_id):
     ]
 
     for index, row in enumerate(rows, 1):
-
         remaining = (
             row["expiry_date"] - today
         ).days
@@ -716,20 +682,16 @@ async def show_products(chat_id, user_id):
                 "⚠️ Срок годности истёк. "
                 "Не рекомендуется употреблять."
             )
-
         elif remaining == 0:
             status = (
                 "⚠️ Сегодня последний день "
                 "по указанной дате."
             )
-
         else:
-            status = (
-                f"⏳ Осталось дней: {remaining}"
-            )
+            status = f"⏳ Осталось дней: {remaining}"
 
         lines.append(
-            f"**{index}.** {emoji} {row['name']}\n"
+            f"{index}. {emoji} {row['name']}\n"
             f"📅 Дата: "
             f"{row['expiry_date'].strftime('%d.%m.%Y')}\n"
             f"{status}\n"
@@ -743,10 +705,7 @@ async def show_products(chat_id, user_id):
         "🗑 Удалить продукт: /delete"
     ])
 
-    await send(
-        chat_id,
-        "\n".join(lines)
-    )
+    await send(chat_id, "\n".join(lines))
 
 
 # ==================================================
@@ -754,7 +713,6 @@ async def show_products(chat_id, user_id):
 # ==================================================
 
 async def start_delete(chat_id, user_id):
-
     rows = await get_user_products(user_id)
 
     if not rows:
@@ -769,7 +727,7 @@ async def start_delete(chat_id, user_id):
     }
 
     lines = [
-        "🗑 **Удаление продукта**",
+        "🗑 Удаление продукта",
         "",
         "Выбери номер продукта:",
         ""
@@ -797,7 +755,6 @@ async def start_delete(chat_id, user_id):
 # ==================================================
 
 async def start_edit(chat_id, user_id):
-
     rows = await get_user_products(user_id)
 
     if not rows:
@@ -812,7 +769,7 @@ async def start_edit(chat_id, user_id):
     }
 
     lines = [
-        "✏️ **Редактирование продукта**",
+        "✏️ Редактирование продукта",
         "",
         "Выбери номер продукта:",
         ""
@@ -840,7 +797,6 @@ async def start_edit(chat_id, user_id):
 # ==================================================
 
 async def handle_text(chat_id, user_id, text):
-
     state = user_states.get(user_id)
 
     if not state:
@@ -848,12 +804,12 @@ async def handle_text(chat_id, user_id, text):
         return
 
     step = state.get("step")
-        # ----------------------------------------------
+
+    # ----------------------------------------------
     # ВЫБОР ЧАСОВОГО ПОЯСА
     # ----------------------------------------------
 
     if step == "timezone_choice":
-
         choice = text.strip()
 
         if choice not in TIMEZONE_OPTIONS:
@@ -869,8 +825,15 @@ async def handle_text(chat_id, user_id, text):
         try:
             ZoneInfo(timezone)
         except Exception:
-            logger.exception("Некорректный часовой пояс: %s", timezone)
-            await send(chat_id, "⚠️ Не удалось установить часовой пояс. Попробуй позже.")
+            logger.exception(
+                "Некорректный часовой пояс: %s",
+                timezone
+            )
+            await send(
+                chat_id,
+                "⚠️ Не удалось установить часовой пояс. "
+                "Попробуй позже."
+            )
             return
 
         await db.execute("""
@@ -901,7 +864,6 @@ async def handle_text(chat_id, user_id, text):
     # ----------------------------------------------
 
     if step == "name":
-
         name = text.strip()
 
         if not name or len(name) > 100:
@@ -924,7 +886,6 @@ async def handle_text(chat_id, user_id, text):
             "срока годности.\n\n"
             "Например: 25.12.2026"
         )
-
         return
 
     # ----------------------------------------------
@@ -932,13 +893,11 @@ async def handle_text(chat_id, user_id, text):
     # ----------------------------------------------
 
     if step == "date":
-
         try:
             expiry = datetime.strptime(
                 text.strip(),
                 "%d.%m.%Y"
             ).date()
-
         except ValueError:
             await send(
                 chat_id,
@@ -971,13 +930,11 @@ async def handle_text(chat_id, user_id, text):
                 "⚠️ Указанная дата уже прошла.\n"
                 "Не рекомендуется употреблять продукт."
             )
-
         elif remaining == 0:
             status = (
                 "⚠️ Сегодня последний день "
                 "по указанной дате."
             )
-
         else:
             status = (
                 f"⏳ По указанной дате осталось "
@@ -993,7 +950,6 @@ async def handle_text(chat_id, user_id, text):
             f"{status}\n\n"
             "Посмотреть корзину: /list"
         )
-
         return
 
     # ----------------------------------------------
@@ -1001,7 +957,6 @@ async def handle_text(chat_id, user_id, text):
     # ----------------------------------------------
 
     if step == "delete_number":
-
         rows = await get_user_products(user_id)
 
         if not rows:
@@ -1035,7 +990,6 @@ async def handle_text(chat_id, user_id, text):
             "1 — Да, удалить\n"
             "2 — Нет, отменить"
         )
-
         return
 
     # ----------------------------------------------
@@ -1043,22 +997,21 @@ async def handle_text(chat_id, user_id, text):
     # ----------------------------------------------
 
     if step == "delete_confirm":
-
         answer = text.strip().casefold()
 
         if answer in ("1", "да", "удалить"):
-
             result = await db.execute("""
                 DELETE FROM products
                 WHERE id = $1 AND user_id = $2
             """, state["product_id"], user_id)
 
+            product_name = state["product_name"]
             user_states.pop(user_id, None)
 
             if result == "DELETE 1":
                 await send(
                     chat_id,
-                    f"✅ Продукт «{state['product_name']}» "
+                    f"✅ Продукт «{product_name}» "
                     "успешно удалён.\n\n"
                     "Посмотреть корзину: /list"
                 )
@@ -1077,7 +1030,6 @@ async def handle_text(chat_id, user_id, text):
                 "↩️ Удаление отменено. "
                 "Продукт остался в корзине."
             )
-
         else:
             await send(
                 chat_id,
@@ -1093,7 +1045,6 @@ async def handle_text(chat_id, user_id, text):
     # ----------------------------------------------
 
     if step == "edit_number":
-
         rows = await get_user_products(user_id)
 
         if not rows:
@@ -1127,7 +1078,6 @@ async def handle_text(chat_id, user_id, text):
             "1 — Название продукта\n"
             "2 — Срок годности"
         )
-
         return
 
     # ----------------------------------------------
@@ -1135,7 +1085,6 @@ async def handle_text(chat_id, user_id, text):
     # ----------------------------------------------
 
     if step == "edit_choice":
-
         answer = text.strip()
 
         if answer == "1":
@@ -1156,7 +1105,6 @@ async def handle_text(chat_id, user_id, text):
                 "Формат: ДД.ММ.ГГГГ\n"
                 "Например: 25.12.2026"
             )
-
         else:
             await send(
                 chat_id,
@@ -1172,7 +1120,6 @@ async def handle_text(chat_id, user_id, text):
     # ----------------------------------------------
 
     if step == "edit_name":
-
         new_name = text.strip()
 
         if not new_name or len(new_name) > 100:
@@ -1212,13 +1159,11 @@ async def handle_text(chat_id, user_id, text):
     # ----------------------------------------------
 
     if step == "edit_date":
-
         try:
             new_date = datetime.strptime(
                 text.strip(),
                 "%d.%m.%Y"
             ).date()
-
         except ValueError:
             await send(
                 chat_id,
@@ -1266,16 +1211,13 @@ async def handle_text(chat_id, user_id, text):
 # ==================================================
 
 async def handle(request):
-
     if request.headers.get(
         "X-Telegram-Bot-Api-Secret-Token"
     ) != WEBHOOK_SECRET:
-
         return web.Response(status=403)
 
     try:
         update = await request.json()
-
         message = update.get("message", {})
 
         text = message.get("text", "").strip()
@@ -1296,40 +1238,25 @@ async def handle(request):
         command = text.split()[0].split("@")[0]
 
         if command == "/start":
-
             user_states.pop(user_id, None)
             await start(chat_id)
 
         elif command == "/add":
-
             await add_product(chat_id, user_id)
 
         elif command == "/list":
-
             await show_products(chat_id, user_id)
 
         elif command == "/delete":
-
             await start_delete(chat_id, user_id)
 
         elif command == "/edit":
-
-    await start_edit(chat_id, user_id)
-
-        elif command == "/delete":
-
-            await start_delete(chat_id, user_id)
-
-        elif command == "/edit":
-
             await start_edit(chat_id, user_id)
 
         elif command == "/timezone":
-
             await start_timezone(chat_id, user_id)
 
         elif command == "/cancel":
-
             user_states.pop(user_id, None)
 
             await send(
@@ -1338,10 +1265,6 @@ async def handle(request):
             )
 
         elif command == "/help":
-
-            await send(
-        elif command == "/help":
-
             await send(
                 chat_id,
                 "📖 Помощь\n\n"
@@ -1359,7 +1282,6 @@ async def handle(request):
             )
 
         else:
-
             await handle_text(
                 chat_id,
                 user_id,
@@ -1369,9 +1291,7 @@ async def handle(request):
         return web.json_response({"ok": True})
 
     except Exception:
-
         logger.exception("Ошибка обработки сообщения")
-
         return web.json_response({"ok": True})
 
 
@@ -1401,7 +1321,6 @@ app.on_cleanup.append(cleanup)
 
 
 if __name__ == "__main__":
-
     port = int(
         os.environ.get("PORT", 10000)
     )
