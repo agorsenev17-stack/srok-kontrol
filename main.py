@@ -1313,9 +1313,13 @@ async def handle(request):
 
         elif command == "/edit":
 
-            await start_edit(chat_id, user_id)
+    await start_edit(chat_id, user_id)
 
-        elif command == "/cancel":
+elif command == "/timezone":
+
+    await start_timezone(chat_id, user_id)
+
+elif command == "/cancel":
 
             user_states.pop(user_id, None)
 
