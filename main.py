@@ -1,14 +1,16 @@
 
 import os
-import json
 import logging
-from datetime import date, datetime
 from aiohttp import web, ClientSession
 
 TOKEN = os.environ["TELEGRAM_TOKEN"]
+WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
+
 BASE_URL = f"https://api.telegram.org/bot{TOKEN}"
 
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 
 async def telegram(method, data):
     async with ClientSession() as session:
@@ -17,8 +19,29 @@ async def telegram(method, data):
         ) as response:
             return await response.json()
 
+
+async def setup_webhook(app):
+    render_url = os.environ.get("RENDER_EXTERNAL_URL")
+
+    if not render_url:
+        logger.error("RENDER_EXTERNAL_URL не найден")
+        return
+
+    result = await telegram("setWebhook", {
+        "url": f"{render_url}/webhook",
+        "secret_token": WEBHOOK_SECRET,
+        "allowed_updates": ["message"]
+    })
+
+    if result.get("ok"):
+        logger.info("Webhook успешно подключён")
+    else:
+        logger.error("Не удалось подключить Webhook")
+
+
 async def start(update):
     chat_id = update["message"]["chat"]["id"]
+
     await telegram("sendMessage", {
         "chat_id": chat_id,
         "text": (
@@ -28,27 +51,37 @@ async def start(update):
         )
     })
 
+
 async def handle(request):
+    if request.headers.get(
+        "X-Telegram-Bot-Api-Secret-Token"
+    ) != WEBHOOK_SECRET:
+        return web.Response(status=403)
+
     try:
         update = await request.json()
         message = update.get("message", {})
         text = message.get("text", "")
-        
+
         if text.startswith("/start"):
             await start(update)
 
         return web.json_response({"ok": True})
 
     except Exception:
-        logging.exception("Ошибка обработки сообщения")
+        logger.exception("Ошибка обработки сообщения")
         return web.json_response({"ok": True})
+
 
 async def health(request):
     return web.json_response({"status": "ok"})
 
+
 app = web.Application()
 app.router.add_post("/webhook", handle)
 app.router.add_get("/", health)
+app.on_startup.append(setup_webhook)
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
