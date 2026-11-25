@@ -488,6 +488,15 @@ async def setup(app):
             created_at TIMESTAMPTZ DEFAULT NOW()
         )
     """)
+
+    await db.execute("""
+    CREATE TABLE IF NOT EXISTS user_settings (
+        user_id BIGINT PRIMARY KEY,
+        timezone TEXT NOT NULL DEFAULT 'Europe/Moscow',
+        reminder_hour INTEGER NOT NULL DEFAULT 9
+    )
+""")
+    
     await db.execute("""
     CREATE TABLE IF NOT EXISTS user_settings (
         user_id BIGINT PRIMARY KEY,
