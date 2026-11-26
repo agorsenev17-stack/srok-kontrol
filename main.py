@@ -3,6 +3,9 @@ import os
 import re
 import json
 import logging
+import io
+import pytesseract
+from PIL import Image
 from pathlib import Path
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
