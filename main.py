@@ -1126,8 +1126,8 @@ async def start(chat_id):
                 {"text": "⚙️ Настройки"}
             ]
         ],
-        "resize_keyboard": True,
-        "is_persistent": True
+        "is_persistent": False,
+"one_time_keyboard": True
     }
 
     await send(
