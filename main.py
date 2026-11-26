@@ -54,10 +54,7 @@ TIMEZONE_OPTIONS = {
     ),
     "8": ("Иркутск, Улан-Удэ", "Asia/Irkutsk"),
     "9": ("Якутск, Чита", "Asia/Yakutsk"),
-    "10": (
-        "Владивосток, Хабаровск, Биробиджан",
-        "Asia/Vladivostok"
-    ),
+    "10": ("Владивосток, Хабаровск, Биробиджан", "Asia/Vladivostok"),
     "11": ("Магадан, Южно-Сахалинск", "Asia/Magadan"),
     "12": (
         "Петропавловск-Камчатский, Анадырь",
@@ -73,6 +70,9 @@ http = None
 
 user_states = {}
 additives = {}
+
+# Ссылки на фоновые задачи обработки фотографий
+background_tasks = set()
 
 
 # ==================================================
@@ -367,166 +367,165 @@ def find_additives(text):
 
 
 # ==================================================
-# КАРТОЧКИ ДОБАВОК И АРОМАТИЗАТОРОВ
+# РАСПОЗНАВАНИЕ ТЕКСТА НА ФОТОГРАФИЯХ
 # ==================================================
 
-async def handle_photo(chat_id, user_id, message):
-    try:
-        photos = message.get("photo", [])
+def recognize_label(image_data):
+    """
+    Синхронная OCR-функция.
+    Вызывается через asyncio.to_thread,
+    поэтому не блокирует обработку сообщений Telegram.
+    """
 
-        if not photos:
-            await send(
-                chat_id,
-                "❌ Не удалось получить фотографию. "
-                "Попробуй отправить её ещё раз."
-            )
-            return
+    image = Image.open(io.BytesIO(image_data))
+    image = ImageOps.exif_transpose(image)
 
-        # Берём фотографию в максимальном доступном размере
-        photo = photos[-1]
-        file_id = photo.get("file_id")
+    # Ограничиваем разрешение для экономии памяти
+    if image.width * image.height > 25_000_000:
+        image.thumbnail((3000, 3000))
 
-        if not file_id:
-            await send(
-                chat_id,
-                "❌ Не удалось определить файл фотографии."
-            )
-            return
+    image = image.convert("L")
 
-        # Получаем путь к фотографии через Telegram
-        file_info = await telegram(
-            "getFile",
-            {"file_id": file_id}
+    # Увеличиваем мелкий текст
+    image.thumbnail((2200, 2200))
+    image = image.resize(
+        (image.width * 2, image.height * 2),
+        Image.Resampling.LANCZOS
+    )
+
+    # Улучшаем контрастность и резкость
+    clean_image = ImageOps.autocontrast(image)
+    clean_image = ImageEnhance.Contrast(
+        clean_image
+    ).enhance(1.6)
+
+    clean_image = ImageEnhance.Sharpness(
+        clean_image
+    ).enhance(1.5)
+
+    clean_image = clean_image.filter(
+        ImageFilter.UnsharpMask(
+            radius=1,
+            percent=130,
+            threshold=3
+        )
+    )
+
+    # Дополнительный вариант с чёрно-белым текстом
+    threshold_image = clean_image.point(
+        lambda pixel: 255 if pixel > 160 else 0
+    )
+
+    variants = [
+        (clean_image, "--oem 1 --psm 6"),
+        (clean_image, "--oem 1 --psm 11"),
+        (threshold_image, "--oem 1 --psm 6")
+    ]
+
+    candidates = []
+
+    for candidate_image, config in variants:
+        try:
+            result = pytesseract.image_to_string(
+                candidate_image,
+                lang="rus+eng",
+                config=config,
+                timeout=20
+            ).strip()
+
+            if result and result not in candidates:
+                candidates.append(result)
+
+        except Exception:
+            logger.exception("Ошибка одного из режимов OCR")
+
+    return candidates
+
+
+def choose_best_ocr(candidates):
+    if not candidates:
+        return ""
+
+    def score(candidate):
+        matches = len(find_additives(candidate))
+        useful_chars = sum(
+            character.isalnum()
+            for character in candidate
         )
 
-        if not file_info.get("ok"):
-            await send(
-                chat_id,
-                "❌ Не удалось загрузить фотографию из Telegram."
-            )
-            return
-
-        file_data = file_info.get("result", {})
-        file_path = file_data.get("file_path")
-
-        if not file_path:
-            await send(
-                chat_id,
-                "❌ Telegram не предоставил файл фотографии."
-            )
-            return
-
-        # Ограничиваем размер файла
-        file_size = file_data.get("file_size", 0)
-
-        if file_size > 10 * 1024 * 1024:
-            await send(
-                chat_id,
-                "⚠️ Фотография слишком большая. "
-                "Отправь изображение меньшего размера."
-            )
-            return
-
-        # Загружаем изображение
-        file_url = (
-            f"https://api.telegram.org/file/bot{TOKEN}/{file_path}"
+        return (
+            matches,
+            useful_chars,
+            len(candidate)
         )
 
-        async with http.get(file_url) as response:
-            if response.status != 200:
-                await send(
-                    chat_id,
-                    "❌ Не удалось скачать фотографию."
-                )
-                return
+    return max(candidates, key=score)
 
-            image_data = await response.read()
 
-        if len(image_data) > 10 * 1024 * 1024:
-            await send(
-                chat_id,
-                "⚠️ Размер фотографии превышает допустимый."
-            )
-            return
+# ==================================================
+# АНАЛИЗ ДОБАВОК
+# ==================================================
 
-        # Открываем и подготавливаем изображение
-        image = Image.open(
-            io.BytesIO(image_data)
-        )
-
-        image = image.convert("L")
-
-        # Распознаём русский и английский текст
-        recognized_text = pytesseract.image_to_string(
-            image,
-            lang="rus+eng",
-            config="--psm 6"
-        ).strip()
-
-        # Учитываем подпись к фотографии
-        caption = message.get("caption", "").strip()
-
-        combined_text = "\n".join(
-            part for part in [caption, recognized_text]
-            if part
-        )
-
-        if not combined_text:
-            await send(
-                chat_id,
-                "🔎 Не удалось распознать текст на фотографии.\n\n"
-                "Попробуй сделать снимок чётче, "
-                "приблизить состав и обеспечить хорошее освещение."
-            )
-            return
-
-        await send(
-            chat_id,
-            "📸 Фотография обработана!\n\n"
-            "📝 Распознанный текст:\n"
-            + recognized_text[:1200]
-            + "\n\n🔬 Проверяю найденные вещества..."
-        )
-
-        # Передаём распознанный текст в существующий справочник
-        await check_additives(
-            chat_id,
-            combined_text
-        )
-
-    except Exception:
-        logger.exception("Ошибка распознавания фотографии")
-
-        await send(
-            chat_id,
-            "❌ При обработке фотографии произошла ошибка.\n\n"
-            "Попробуй отправить изображение ещё раз."
-        )
-
-async def check_additives(chat_id, text):
+async def check_additives(chat_id, text, photo_text=None):
     found = find_additives(text)
 
+    # Если добавки не найдены
     if not found:
-        await send(
-            chat_id,
+        lines = []
+
+        if photo_text is not None:
+            lines.extend([
+                "📸 Фотография обработана!",
+                "",
+                "📝 Распознанный текст:",
+                photo_text[:1200] if photo_text else
+                "Не удалось уверенно распознать текст.",
+                "",
+                "🔬 Результат проверки:",
+                ""
+            ])
+
+        lines.extend([
             "🔎 В нашем справочнике пока не найдены "
-            "известные добавки из этого текста.\n\n"
-            "Попробуй отправить:\n"
-            "• E325\n"
-            "• E621\n"
-            "• Ванилин\n"
-            "• Ментол\n"
-            "• Лимонен\n\n"
-            "Также можно отправить английское название.\n\n"
+            "известные добавки из этого текста.",
+            "",
+            "Попробуй отправить:",
+            "• E325",
+            "• E621",
+            "• Ванилин",
+            "• Ментол",
+            "• Лимонен",
+            "",
+            "Также можно отправить английское название.",
+            "",
             "ℹ️ Отсутствие результата не означает, "
-            "что продукт опасен или запрещён."
-        )
+            "что продукт опасен или запрещён.",
+            "",
+            "⚠️ OCR может ошибаться: проверь распознанный "
+            "текст по оригинальной упаковке."
+        ])
+
+        await send(chat_id, "\n".join(lines))
         return
 
-    lines = [
+    lines = []
+
+    if photo_text is not None:
+        lines.extend([
+            "📸 Фотография обработана!",
+            "",
+            "📝 Распознанный текст:",
+            photo_text[:1200] if photo_text else
+            "Не удалось уверенно распознать текст.",
+            "",
+            "🔬 Результат проверки:",
+            ""
+        ])
+
+    lines.extend([
         f"🔬 Найдено записей: {len(found)}",
         ""
-    ]
+    ])
 
     for item in found[:10]:
         status = str(
@@ -611,10 +610,157 @@ async def check_additives(chat_id, text):
         "Важны количество вещества, категория продукта, "
         "условия применения и индивидуальная чувствительность.",
         "",
+        "⚠️ Распознавание фотографии может ошибаться. "
+        "Сверяй состав с оригинальной упаковкой.",
+        "",
         "🛒 Для проверки срока годности используй /add."
     ])
 
     await send(chat_id, "\n".join(lines))
+
+
+# ==================================================
+# ОБРАБОТКА ФОТОГРАФИИ
+# ==================================================
+
+async def handle_photo(chat_id, user_id, message):
+    try:
+        photos = message.get("photo", [])
+
+        if not photos:
+            await send(
+                chat_id,
+                "❌ Не удалось получить фотографию. "
+                "Попробуй отправить её ещё раз."
+            )
+            return
+
+        # Берём фотографию в максимальном доступном размере
+        photo = photos[-1]
+        file_id = photo.get("file_id")
+
+        if not file_id:
+            await send(
+                chat_id,
+                "❌ Не удалось определить файл фотографии."
+            )
+            return
+
+        # Получаем путь к фотографии через Telegram
+        file_info = await telegram(
+            "getFile",
+            {"file_id": file_id}
+        )
+
+        if not file_info.get("ok"):
+            await send(
+                chat_id,
+                "❌ Не удалось загрузить фотографию из Telegram."
+            )
+            return
+
+        file_data = file_info.get("result", {})
+        file_path = file_data.get("file_path")
+
+        if not file_path:
+            await send(
+                chat_id,
+                "❌ Telegram не предоставил файл фотографии."
+            )
+            return
+
+        # Ограничиваем размер файла
+        file_size = file_data.get("file_size", 0)
+
+        if file_size > 10 * 1024 * 1024:
+            await send(
+                chat_id,
+                "⚠️ Фотография слишком большая. "
+                "Отправь изображение меньшего размера."
+            )
+            return
+
+        # Загружаем изображение
+        file_url = (
+            f"https://api.telegram.org/file/bot{TOKEN}/{file_path}"
+        )
+
+        async with http.get(file_url) as response:
+            if response.status != 200:
+                await send(
+                    chat_id,
+                    "❌ Не удалось скачать фотографию."
+                )
+                return
+
+            image_data = await response.read()
+
+        if len(image_data) > 10 * 1024 * 1024:
+            await send(
+                chat_id,
+                "⚠️ Размер фотографии превышает допустимый."
+            )
+            return
+
+        # OCR выполняется в отдельном потоке
+        candidates = await asyncio.to_thread(
+            recognize_label,
+            image_data
+        )
+
+        recognized_text = choose_best_ocr(candidates)
+
+        # Учитываем подпись к фотографии
+        caption = (message.get("caption") or "").strip()
+
+        combined_text = "\n".join(
+            part for part in [caption, "\n".join(candidates)]
+            if part
+        )
+
+        if not combined_text:
+            await send(
+                chat_id,
+                "🔎 Не удалось распознать текст на фотографии.\n\n"
+                "Попробуй сделать снимок чётче, "
+                "приблизить состав и обеспечить хорошее освещение."
+            )
+            return
+
+        # Одно итоговое сообщение вместо двух
+        await check_additives(
+            chat_id,
+            combined_text,
+            photo_text=recognized_text
+        )
+
+    except Exception:
+        logger.exception("Ошибка распознавания фотографии")
+
+        await send(
+            chat_id,
+            "❌ При обработке фотографии произошла ошибка.\n\n"
+            "Попробуй отправить изображение ещё раз."
+        )
+
+
+def background_task_done(task):
+    background_tasks.discard(task)
+
+    if task.cancelled():
+        return
+
+    error = task.exception()
+
+    if error:
+        logger.error(
+            "Ошибка фоновой задачи",
+            exc_info=(
+                type(error),
+                error,
+                error.__traceback__
+            )
+        )
 
 
 # ==================================================
@@ -656,7 +802,8 @@ async def setup(app):
             created_at TIMESTAMPTZ DEFAULT NOW()
         )
     """)
-        await db.execute("""
+
+    await db.execute("""
         CREATE TABLE IF NOT EXISTS processed_updates (
             update_id BIGINT PRIMARY KEY,
             processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -693,6 +840,20 @@ async def setup(app):
 
 async def cleanup(app):
     global db, http
+
+    # Даём активным задачам завершиться перед закрытием HTTP и БД
+    if background_tasks:
+        tasks = list(background_tasks)
+
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=30
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Не все фоновые задачи завершились при остановке"
+            )
 
     if db:
         await db.close()
@@ -1358,8 +1519,6 @@ async def handle_text(chat_id, user_id, text):
 # ПОЛУЧЕНИЕ СООБЩЕНИЙ TELEGRAM
 # ==================================================
 
-
-            
 async def handle(request):
     if request.headers.get(
         "X-Telegram-Bot-Api-Secret-Token"
@@ -1368,7 +1527,9 @@ async def handle(request):
 
     try:
         update = await request.json()
-                update_id = update.get("update_id")
+
+        # Постоянная защита от повторных обновлений Telegram
+        update_id = update.get("update_id")
 
         if update_id is not None:
             try:
@@ -1383,11 +1544,14 @@ async def handle(request):
                     return web.json_response({"ok": True})
 
             except Exception:
-                logger.exception("Ошибка проверки повторного обновления")
+                logger.exception(
+                    "Ошибка проверки повторного обновления"
+                )
                 return web.Response(status=500)
+
         message = update.get("message", {})
 
-        text = message.get("text", "").strip()
+        text = (message.get("text") or "").strip()
 
         chat_id = message.get(
             "chat",
@@ -1404,13 +1568,20 @@ async def handle(request):
         ):
             return web.json_response({"ok": True})
 
-        # 📸 Обработка фотографий состава продукта
+        # Фотографии отправляем в фоновую обработку.
+        # Webhook быстро отвечает Telegram и не ждёт OCR.
         if message.get("photo"):
-            await handle_photo(
-                chat_id,
-                user_id,
-                message
+            task = asyncio.create_task(
+                handle_photo(
+                    chat_id,
+                    user_id,
+                    message
+                )
             )
+
+            background_tasks.add(task)
+            task.add_done_callback(background_task_done)
+
             return web.json_response({"ok": True})
 
         command = text.split()[0].split("@")[0]
@@ -1473,7 +1644,6 @@ async def handle(request):
     except Exception:
         logger.exception("Ошибка обработки сообщения")
         return web.json_response({"ok": True})
-
 
 
 # ==================================================
