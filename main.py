@@ -5,6 +5,7 @@ import json
 import logging
 import io
 import asyncio
+import threading
 import pytesseract
 
 from PIL import (
@@ -36,7 +37,10 @@ MAX_PHOTO_SIZE = 10 * 1024 * 1024
 MAX_IMAGE_PIXELS = 25_000_000
 
 # Максимальное время одной попытки OCR
-OCR_TIMEOUT = 12
+OCR_TIMEOUT = 35
+
+# Не допускаем одновременного запуска нескольких OCR
+OCR_LOCK = threading.Lock()
 
 TIMEZONE_OPTIONS = {
     "1": ("Калининград", "Europe/Kaliningrad"),
@@ -83,7 +87,7 @@ additives = {}
 
 background_tasks = set()
 
-# Не допускаем одновременную тяжёлую обработку фотографий
+# Ограничиваем количество одновременно обрабатываемых фотографий
 ocr_semaphore = asyncio.Semaphore(1)
 
 
@@ -387,17 +391,17 @@ def find_additives(text):
 
 def prepare_ocr_images(image_data):
     """
-    Готовит два облегчённых варианта изображения.
-    Не увеличивает фотографию до чрезмерных размеров.
+    Готовит изображение для распознавания.
+    Не увеличивает маленькие фотографии,
+    чтобы не замедлять Tesseract.
     """
 
     with Image.open(io.BytesIO(image_data)) as original:
         image = ImageOps.exif_transpose(original)
 
-        # Проверяем размер до преобразования в RGB
         if image.width * image.height > MAX_IMAGE_PIXELS:
             image.thumbnail(
-                (1800, 1800),
+                (4000, 4000),
                 Image.Resampling.LANCZOS
             )
 
@@ -410,42 +414,13 @@ def prepare_ocr_images(image_data):
     )
 
     gray = ImageOps.grayscale(image)
+    gray = ImageOps.autocontrast(gray)
 
-    # Увеличиваем только маленькие фотографии
-    longest_side = max(gray.size)
+    gray = ImageEnhance.Contrast(
+        gray
+    ).enhance(1.25)
 
-    if longest_side < 1200:
-        scale = min(1.5, 1800 / longest_side)
-
-        new_size = (
-            max(1, int(gray.width * scale)),
-            max(1, int(gray.height * scale))
-        )
-
-        gray = gray.resize(
-            new_size,
-            Image.Resampling.LANCZOS
-        )
-
-    clean = ImageOps.autocontrast(gray)
-
-    clean = ImageEnhance.Contrast(
-        clean
-    ).enhance(1.35)
-
-    clean = ImageEnhance.Sharpness(
-        clean
-    ).enhance(1.3)
-
-    # Второй вариант — бинаризация
-    threshold = clean.point(
-        lambda pixel: 255 if pixel > 155 else 0
-    )
-
-    return [
-        ("основной", clean, "--oem 1 --psm 6"),
-        ("дополнительный", threshold, "--oem 1 --psm 11")
-    ]
+    return gray
 
 
 # ==================================================
@@ -454,57 +429,54 @@ def prepare_ocr_images(image_data):
 
 def recognize_label(image_data):
     """
-    Выполняет максимум две попытки OCR.
-    Каждая попытка ограничена по времени.
+    Используем два режима OCR вместо пяти.
+    Обработка защищена блокировкой.
     """
-
-    variants = prepare_ocr_images(image_data)
 
     candidates = []
     errors = []
 
-    for variant_name, candidate_image, config in variants:
-        try:
-            result = pytesseract.image_to_string(
-                candidate_image,
-                lang="rus+eng",
-                config=config,
-                timeout=OCR_TIMEOUT
-            ).strip()
+    with OCR_LOCK:
+        image = prepare_ocr_images(image_data)
 
-            logger.info(
-                "OCR: режим '%s', символов: %s",
-                variant_name,
-                len(result)
-            )
+        modes = [
+            ("обычный", "--oem 1 --psm 6"),
+            ("блоки текста", "--oem 1 --psm 11")
+        ]
 
-            if result and result not in candidates:
-                candidates.append(result)
+        for mode_name, config in modes:
+            try:
+                result = pytesseract.image_to_string(
+                    image,
+                    lang="rus+eng",
+                    config=config,
+                    timeout=OCR_TIMEOUT
+                ).strip()
 
-        except RuntimeError as error:
-            errors.append(
-                f"{variant_name}: {type(error).__name__}: {error}"
-            )
+                logger.info(
+                    "OCR: режим '%s', получено символов: %s",
+                    mode_name,
+                    len(result)
+                )
 
-            logger.warning(
-                "OCR: ошибка режима '%s': %s",
-                variant_name,
-                error
-            )
+                if result and result not in candidates:
+                    candidates.append(result)
 
-        except Exception as error:
-            errors.append(
-                f"{variant_name}: {type(error).__name__}: {error}"
-            )
+            except Exception as error:
+                errors.append(
+                    f"{mode_name}: "
+                    f"{type(error).__name__}: {error}"
+                )
 
-            logger.exception(
-                "Ошибка OCR в режиме '%s'",
-                variant_name
-            )
+                logger.warning(
+                    "Ошибка OCR в режиме '%s': %s",
+                    mode_name,
+                    error
+                )
 
-    if not candidates and errors:
+    if not candidates:
         raise RuntimeError(
-            "Все режимы OCR завершились ошибкой: "
+            "Не удалось распознать текст. Ошибки: "
             + " | ".join(errors)
         )
 
@@ -855,7 +827,6 @@ async def handle_photo(chat_id, user_id, message):
         )
 
         try:
-            # Одновременно обрабатывается только одна фотография
             async with ocr_semaphore:
                 candidates = await asyncio.to_thread(
                     recognize_label,
