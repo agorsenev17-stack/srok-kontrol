@@ -1368,6 +1368,23 @@ async def handle(request):
 
     try:
         update = await request.json()
+                update_id = update.get("update_id")
+
+        if update_id is not None:
+            try:
+                inserted = await db.fetchval("""
+                    INSERT INTO processed_updates (update_id)
+                    VALUES ($1)
+                    ON CONFLICT (update_id) DO NOTHING
+                    RETURNING update_id
+                """, update_id)
+
+                if inserted is None:
+                    return web.json_response({"ok": True})
+
+            except Exception:
+                logger.exception("Ошибка проверки повторного обновления")
+                return web.Response(status=500)
         message = update.get("message", {})
 
         text = message.get("text", "").strip()
