@@ -1,2 +1,5 @@
+
 aiohttp
 asyncpg
+Pillow
+pytesseract
