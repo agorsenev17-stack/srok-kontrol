@@ -364,6 +364,139 @@ def find_additives(text):
 # КАРТОЧКИ ДОБАВОК И АРОМАТИЗАТОРОВ
 # ==================================================
 
+async def handle_photo(chat_id, user_id, message):
+    try:
+        photos = message.get("photo", [])
+
+        if not photos:
+            await send(
+                chat_id,
+                "❌ Не удалось получить фотографию. "
+                "Попробуй отправить её ещё раз."
+            )
+            return
+
+        # Берём фотографию в максимальном доступном размере
+        photo = photos[-1]
+        file_id = photo.get("file_id")
+
+        if not file_id:
+            await send(
+                chat_id,
+                "❌ Не удалось определить файл фотографии."
+            )
+            return
+
+        # Получаем путь к фотографии через Telegram
+        file_info = await telegram(
+            "getFile",
+            {"file_id": file_id}
+        )
+
+        if not file_info.get("ok"):
+            await send(
+                chat_id,
+                "❌ Не удалось загрузить фотографию из Telegram."
+            )
+            return
+
+        file_data = file_info.get("result", {})
+        file_path = file_data.get("file_path")
+
+        if not file_path:
+            await send(
+                chat_id,
+                "❌ Telegram не предоставил файл фотографии."
+            )
+            return
+
+        # Ограничиваем размер файла
+        file_size = file_data.get("file_size", 0)
+
+        if file_size > 10 * 1024 * 1024:
+            await send(
+                chat_id,
+                "⚠️ Фотография слишком большая. "
+                "Отправь изображение меньшего размера."
+            )
+            return
+
+        # Загружаем изображение
+        file_url = (
+            f"https://api.telegram.org/file/bot{TOKEN}/{file_path}"
+        )
+
+        async with http.get(file_url) as response:
+            if response.status != 200:
+                await send(
+                    chat_id,
+                    "❌ Не удалось скачать фотографию."
+                )
+                return
+
+            image_data = await response.read()
+
+        if len(image_data) > 10 * 1024 * 1024:
+            await send(
+                chat_id,
+                "⚠️ Размер фотографии превышает допустимый."
+            )
+            return
+
+        # Открываем и подготавливаем изображение
+        image = Image.open(
+            io.BytesIO(image_data)
+        )
+
+        image = image.convert("L")
+
+        # Распознаём русский и английский текст
+        recognized_text = pytesseract.image_to_string(
+            image,
+            lang="rus+eng",
+            config="--psm 6"
+        ).strip()
+
+        # Учитываем подпись к фотографии
+        caption = message.get("caption", "").strip()
+
+        combined_text = "\n".join(
+            part for part in [caption, recognized_text]
+            if part
+        )
+
+        if not combined_text:
+            await send(
+                chat_id,
+                "🔎 Не удалось распознать текст на фотографии.\n\n"
+                "Попробуй сделать снимок чётче, "
+                "приблизить состав и обеспечить хорошее освещение."
+            )
+            return
+
+        await send(
+            chat_id,
+            "📸 Фотография обработана!\n\n"
+            "📝 Распознанный текст:\n"
+            + recognized_text[:1200]
+            + "\n\n🔬 Проверяю найденные вещества..."
+        )
+
+        # Передаём распознанный текст в существующий справочник
+        await check_additives(
+            chat_id,
+            combined_text
+        )
+
+    except Exception:
+        logger.exception("Ошибка распознавания фотографии")
+
+        await send(
+            chat_id,
+            "❌ При обработке фотографии произошла ошибка.\n\n"
+            "Попробуй отправить изображение ещё раз."
+        )
+
 async def check_additives(chat_id, text):
     found = find_additives(text)
 
