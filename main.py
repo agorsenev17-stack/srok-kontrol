@@ -154,14 +154,20 @@ async def telegram(method, data):
         return result
 
 
-async def send(chat_id, text):
+
+async def send(chat_id, text, reply_markup=None):
     max_length = 3800
 
     if len(text) <= max_length:
-        await telegram("sendMessage", {
+        payload = {
             "chat_id": chat_id,
             "text": text
-        })
+        }
+
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+
+        await telegram("sendMessage", payload)
         return
 
     chunks = []
@@ -189,11 +195,16 @@ async def send(chat_id, text):
     if current:
         chunks.append(current)
 
-    for chunk in chunks:
-        await telegram("sendMessage", {
+    for index, chunk in enumerate(chunks):
+        payload = {
             "chat_id": chat_id,
             "text": chunk
-        })
+        }
+
+        if index == len(chunks) - 1 and reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+
+        await telegram("sendMessage", payload)
 
 
 # ==================================================
