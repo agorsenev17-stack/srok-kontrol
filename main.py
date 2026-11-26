@@ -656,6 +656,12 @@ async def setup(app):
             created_at TIMESTAMPTZ DEFAULT NOW()
         )
     """)
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS processed_updates (
+            update_id BIGINT PRIMARY KEY,
+            processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
 
     await db.execute("""
         CREATE TABLE IF NOT EXISTS user_settings (
