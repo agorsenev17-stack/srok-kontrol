@@ -1213,6 +1213,8 @@ async def handle_text(chat_id, user_id, text):
 # ПОЛУЧЕНИЕ СООБЩЕНИЙ TELEGRAM
 # ==================================================
 
+
+            
 async def handle(request):
     if request.headers.get(
         "X-Telegram-Bot-Api-Secret-Token"
@@ -1235,7 +1237,18 @@ async def handle(request):
             {}
         ).get("id")
 
-        if not chat_id or not user_id or (not text and not message.get("photo")):
+        if not chat_id or not user_id or (
+            not text and not message.get("photo")
+        ):
+            return web.json_response({"ok": True})
+
+        # 📸 Обработка фотографий состава продукта
+        if message.get("photo"):
+            await handle_photo(
+                chat_id,
+                user_id,
+                message
+            )
             return web.json_response({"ok": True})
 
         command = text.split()[0].split("@")[0]
@@ -1281,7 +1294,9 @@ async def handle(request):
                 "/help — помощь\n\n"
                 "🔬 Для проверки состава отправь "
                 "E325, E621, ванилин, ментол "
-                "или английское название вещества."
+                "или английское название вещества.\n\n"
+                "📸 Также можешь отправить фотографию "
+                "состава продукта для проверки."
             )
 
         else:
@@ -1296,6 +1311,7 @@ async def handle(request):
     except Exception:
         logger.exception("Ошибка обработки сообщения")
         return web.json_response({"ok": True})
+
 
 
 # ==================================================
