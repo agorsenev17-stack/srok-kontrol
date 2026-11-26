@@ -2033,12 +2033,47 @@ async def handle(request):
                 "состава продукта для проверки."
             )
 
-        else:
-            await handle_text(
+        
+else:
+    menu_actions = {
+        "➕ Добавить продукт": "/add",
+        "📦 Мои продукты": "/list",
+        "✏️ Изменить продукт": "/edit",
+        "🗑 Удалить продукт": "/delete",
+        "⏰ Напоминания": "/timezone",
+        "🔬 Справочник": None,
+        "📸 Проверить состав": None,
+        "⚙️ Настройки": "/timezone"
+    }
+
+    if text in menu_actions:
+        action = menu_actions[text]
+
+        if action:
+            await handle_command(
                 chat_id,
                 user_id,
-                text
+                action
             )
+        elif text == "🔬 Справочник":
+            await send(
+                chat_id,
+                "🔬 Справочник добавок\n\n"
+                "Отправь название вещества, "
+                "E-код или ароматизатор для поиска."
+            )
+        elif text == "📸 Проверить состав":
+            await send(
+                chat_id,
+                "📸 Отправь фотографию состава продукта."
+            )
+    else:
+        await handle_text(
+            chat_id,
+            user_id,
+            text
+        )
+
 
         return web.json_response({"ok": True})
 
