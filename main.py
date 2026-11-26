@@ -1,3 +1,4 @@
+
 import os
 import re
 import json
@@ -9,8 +10,7 @@ import pytesseract
 from PIL import (
     Image,
     ImageOps,
-    ImageEnhance,
-    ImageFilter
+    ImageEnhance
 )
 from pathlib import Path
 from datetime import date, datetime
@@ -34,7 +34,9 @@ BASE_URL = f"https://api.telegram.org/bot{TOKEN}"
 
 MAX_PHOTO_SIZE = 10 * 1024 * 1024
 MAX_IMAGE_PIXELS = 25_000_000
-OCR_TIMEOUT = 18
+
+# Максимальное время одной попытки OCR
+OCR_TIMEOUT = 12
 
 TIMEZONE_OPTIONS = {
     "1": ("Калининград", "Europe/Kaliningrad"),
@@ -80,6 +82,9 @@ user_states = {}
 additives = {}
 
 background_tasks = set()
+
+# Не допускаем одновременную тяжёлую обработку фотографий
+ocr_semaphore = asyncio.Semaphore(1)
 
 
 # ==================================================
@@ -382,26 +387,36 @@ def find_additives(text):
 
 def prepare_ocr_images(image_data):
     """
-    Создаёт несколько вариантов одного изображения.
-    Не изменяет исходные данные.
+    Готовит два облегчённых варианта изображения.
+    Не увеличивает фотографию до чрезмерных размеров.
     """
 
     with Image.open(io.BytesIO(image_data)) as original:
         image = ImageOps.exif_transpose(original)
 
+        # Проверяем размер до преобразования в RGB
         if image.width * image.height > MAX_IMAGE_PIXELS:
-            image.thumbnail((4000, 4000))
+            image.thumbnail(
+                (1800, 1800),
+                Image.Resampling.LANCZOS
+            )
 
         image = image.convert("RGB")
 
-    # Сохраняем пропорции, не растягиваем всю упаковку
-    image.thumbnail((2600, 2600), Image.Resampling.LANCZOS)
+    # Ограничиваем размер для ускорения OCR
+    image.thumbnail(
+        (1800, 1800),
+        Image.Resampling.LANCZOS
+    )
 
     gray = ImageOps.grayscale(image)
 
-    # Увеличиваем изображение, если оно небольшое
-    if max(gray.size) < 2200:
-        scale = min(2.0, 2200 / max(gray.size))
+    # Увеличиваем только маленькие фотографии
+    longest_side = max(gray.size)
+
+    if longest_side < 1200:
+        scale = min(1.5, 1800 / longest_side)
+
         new_size = (
             max(1, int(gray.width * scale)),
             max(1, int(gray.height * scale))
@@ -416,35 +431,20 @@ def prepare_ocr_images(image_data):
 
     clean = ImageEnhance.Contrast(
         clean
-    ).enhance(1.45)
+    ).enhance(1.35)
 
     clean = ImageEnhance.Sharpness(
         clean
-    ).enhance(1.5)
+    ).enhance(1.3)
 
-    clean = clean.filter(
-        ImageFilter.UnsharpMask(
-            radius=1,
-            percent=120,
-            threshold=3
-        )
-    )
-
-    # Дополнительные варианты контрастности
-    threshold_145 = clean.point(
-        lambda pixel: 255 if pixel > 145 else 0
-    )
-
-    threshold_175 = clean.point(
-        lambda pixel: 255 if pixel > 175 else 0
+    # Второй вариант — бинаризация
+    threshold = clean.point(
+        lambda pixel: 255 if pixel > 155 else 0
     )
 
     return [
-        ("обычный", clean, "--oem 1 --psm 6"),
-        ("блоки текста", clean, "--oem 1 --psm 11"),
-        ("одна колонка", clean, "--oem 1 --psm 4"),
-        ("контраст 145", threshold_145, "--oem 1 --psm 6"),
-        ("контраст 175", threshold_175, "--oem 1 --psm 11")
+        ("основной", clean, "--oem 1 --psm 6"),
+        ("дополнительный", threshold, "--oem 1 --psm 11")
     ]
 
 
@@ -454,11 +454,8 @@ def prepare_ocr_images(image_data):
 
 def recognize_label(image_data):
     """
-    Выполняет несколько попыток OCR.
-
-    Если все попытки завершились технической ошибкой,
-    выбрасывает исключение, чтобы ошибка не маскировалась
-    под плохое качество фотографии.
+    Выполняет максимум две попытки OCR.
+    Каждая попытка ограничена по времени.
     """
 
     variants = prepare_ocr_images(image_data)
@@ -476,13 +473,24 @@ def recognize_label(image_data):
             ).strip()
 
             logger.info(
-                "OCR: режим '%s', получено символов: %s",
+                "OCR: режим '%s', символов: %s",
                 variant_name,
                 len(result)
             )
 
             if result and result not in candidates:
                 candidates.append(result)
+
+        except RuntimeError as error:
+            errors.append(
+                f"{variant_name}: {type(error).__name__}: {error}"
+            )
+
+            logger.warning(
+                "OCR: ошибка режима '%s': %s",
+                variant_name,
+                error
+            )
 
         except Exception as error:
             errors.append(
@@ -525,7 +533,6 @@ def choose_best_ocr(candidates):
             candidate
         )
 
-        # Отсекаем варианты, состоящие почти полностью из мусора
         useful_words = sum(
             1 for word in words if len(word) >= 3
         )
@@ -848,10 +855,12 @@ async def handle_photo(chat_id, user_id, message):
         )
 
         try:
-            candidates = await asyncio.to_thread(
-                recognize_label,
-                image_data
-            )
+            # Одновременно обрабатывается только одна фотография
+            async with ocr_semaphore:
+                candidates = await asyncio.to_thread(
+                    recognize_label,
+                    image_data
+                )
 
         except Exception:
             logger.exception(
@@ -875,8 +884,6 @@ async def handle_photo(chat_id, user_id, message):
             message.get("caption") or ""
         ).strip()
 
-        # Используем только лучший результат OCR,
-        # а не объединяем все варианты распознавания.
         combined_text = "\n".join(
             part
             for part in (caption, recognized_text)
@@ -1879,4 +1886,4 @@ if __name__ == "__main__":
         app,
         host="0.0.0.0",
         port=port
-            )
+    )
