@@ -1235,7 +1235,7 @@ async def handle(request):
             {}
         ).get("id")
 
-        if not chat_id or not user_id or not text:
+        if not chat_id or not user_id or (not text and not message.get("photo")):
             return web.json_response({"ok": True})
 
         command = text.split()[0].split("@")[0]
