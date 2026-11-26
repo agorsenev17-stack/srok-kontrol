@@ -36,10 +36,7 @@ BASE_URL = f"https://api.telegram.org/bot{TOKEN}"
 MAX_PHOTO_SIZE = 10 * 1024 * 1024
 MAX_IMAGE_PIXELS = 25_000_000
 
-# Максимальное время одной попытки OCR
-OCR_TIMEOUT = 35
-
-# Не допускаем одновременного запуска нескольких OCR
+OCR_TIMEOUT = 12
 OCR_LOCK = threading.Lock()
 
 TIMEZONE_OPTIONS = {
@@ -87,7 +84,6 @@ additives = {}
 
 background_tasks = set()
 
-# Ограничиваем количество одновременно обрабатываемых фотографий
 ocr_semaphore = asyncio.Semaphore(1)
 
 
@@ -330,7 +326,6 @@ def find_additives(text):
     original_text = normalize_search_text(text)
     code_text = normalize_e_codes(text)
 
-    # Ищем E-коды
     codes = re.findall(
         r"(?i)\bE\s*-?\s*\d{3,4}[a-z]?\b",
         code_text
@@ -348,12 +343,10 @@ def find_additives(text):
         if item and item not in found:
             found.append(item)
 
-    # Разбиваем распознанный текст на отдельные слова
     original_words = set(
         re.findall(r"[a-zа-яё0-9]+", original_text)
     )
 
-    # Проверяем названия и синонимы
     for item in additives.values():
         if not isinstance(item, dict):
             continue
@@ -393,8 +386,6 @@ def find_additives(text):
             if not name_words:
                 continue
 
-            # Все слова названия должны присутствовать в тексте.
-            # Поэтому порядок слов больше не имеет значения.
             if all(word in original_words for word in name_words):
                 if item not in found:
                     found.append(item)
@@ -410,9 +401,8 @@ def find_additives(text):
 
 def prepare_ocr_images(image_data):
     """
-    Готовит изображение для распознавания.
-    Не увеличивает маленькие фотографии,
-    чтобы не замедлять Tesseract.
+    Готовит три варианта фотографии:
+    контрастный, чёрно-белый и инвертированный.
     """
 
     with Image.open(io.BytesIO(image_data)) as original:
@@ -426,20 +416,47 @@ def prepare_ocr_images(image_data):
 
         image = image.convert("RGB")
 
-    # Ограничиваем размер для ускорения OCR
     image.thumbnail(
         (1800, 1800),
         Image.Resampling.LANCZOS
     )
 
+    new_size = (
+        min(image.width * 2, 3000),
+        min(image.height * 2, 3000)
+    )
+
+    image = image.resize(
+        new_size,
+        Image.Resampling.LANCZOS
+    )
+
     gray = ImageOps.grayscale(image)
-    gray = ImageOps.autocontrast(gray)
 
-    gray = ImageEnhance.Contrast(
-        gray
-    ).enhance(1.25)
+    enhanced = ImageOps.autocontrast(
+        gray,
+        cutoff=1
+    )
 
-    return gray
+    enhanced = ImageEnhance.Contrast(
+        enhanced
+    ).enhance(1.7)
+
+    enhanced = ImageEnhance.Sharpness(
+        enhanced
+    ).enhance(1.8)
+
+    binary = enhanced.point(
+        lambda pixel: 255 if pixel >= 175 else 0
+    )
+
+    inverted = ImageOps.invert(binary)
+
+    return [
+        ("контраст", enhanced),
+        ("чёрно-белый", binary),
+        ("инверсия", inverted)
+    ]
 
 
 # ==================================================
@@ -447,55 +464,53 @@ def prepare_ocr_images(image_data):
 # ==================================================
 
 def recognize_label(image_data):
-    """
-    Используем два режима OCR вместо пяти.
-    Обработка защищена блокировкой.
-    """
-
     candidates = []
     errors = []
 
     with OCR_LOCK:
-        image = prepare_ocr_images(image_data)
+        images = prepare_ocr_images(image_data)
 
         modes = [
             ("обычный", "--oem 1 --psm 6"),
             ("блоки текста", "--oem 1 --psm 11")
         ]
 
-        for mode_name, config in modes:
-            try:
-                result = pytesseract.image_to_string(
-                    image,
-                    lang="rus+eng",
-                    config=config,
-                    timeout=OCR_TIMEOUT
-                ).strip()
+        for image_name, image in images:
+            for mode_name, config in modes:
+                try:
+                    result = pytesseract.image_to_string(
+                        image,
+                        lang="rus+eng",
+                        config=config,
+                        timeout=OCR_TIMEOUT
+                    ).strip()
 
-                logger.info(
-                    "OCR: режим '%s', получено символов: %s",
-                    mode_name,
-                    len(result)
-                )
+                    logger.info(
+                        "OCR: изображение=%s, режим=%s, символов=%s",
+                        image_name,
+                        mode_name,
+                        len(result)
+                    )
 
-                if result and result not in candidates:
-                    candidates.append(result)
+                    if result and result not in candidates:
+                        candidates.append(result)
 
-            except Exception as error:
-                errors.append(
-                    f"{mode_name}: "
-                    f"{type(error).__name__}: {error}"
-                )
+                except Exception as error:
+                    errors.append(
+                        f"{image_name}/{mode_name}: "
+                        f"{type(error).__name__}: {error}"
+                    )
 
-                logger.warning(
-                    "Ошибка OCR в режиме '%s': %s",
-                    mode_name,
-                    error
-                )
+                    logger.warning(
+                        "Ошибка OCR: изображение=%s, режим=%s, ошибка=%s",
+                        image_name,
+                        mode_name,
+                        error
+                    )
 
     if not candidates:
         raise RuntimeError(
-            "Не удалось распознать текст. Ошибки: "
+            "Все режимы OCR завершились ошибкой: "
             + " | ".join(errors)
         )
 
@@ -757,7 +772,6 @@ async def handle_photo(chat_id, user_id, message):
     )
 
     try:
-        # Сообщаем пользователю, что фотография обрабатывается
         await send(
             chat_id,
             "⏳ Пожалуйста, подождите, ваше фото обрабатывается.\n\n"
@@ -899,8 +913,6 @@ async def handle_photo(chat_id, user_id, message):
                 chat_id,
                 "🔎 Фотография получена, но текст "
                 "не удалось распознать.\n\n"
-                "Я проверил несколько режимов OCR, "
-                "но они не дали читаемого результата.\n\n"
                 "Попробуй отправить фотографию обратной стороны "
                 "упаковки крупнее или отдельным снимком."
             )
@@ -966,7 +978,6 @@ async def setup(app):
     global db, http
 
     load_additives()
-
     check_ocr_environment()
 
     http = ClientSession(
@@ -1244,13 +1255,13 @@ async def start_delete(chat_id, user_id):
         return
 
     user_states[user_id] = {
-        "step": "delete_number"
+        "step": "delete_mode"
     }
 
     lines = [
-        "🗑 Удаление продукта",
+        "🗑 Удаление продуктов",
         "",
-        "Выбери номер продукта:",
+        "Твои продукты:",
         ""
     ]
 
@@ -1264,7 +1275,11 @@ async def start_delete(chat_id, user_id):
 
     lines.extend([
         "",
-        "Отправь номер продукта.",
+        "Как будем удалять?",
+        "",
+        "1 — Один продукт",
+        "2 — Несколько продуктов",
+        "",
         "Для отмены: /cancel"
     ])
 
@@ -1467,7 +1482,49 @@ async def handle_text(chat_id, user_id, text):
         )
         return
 
-    # УДАЛЕНИЕ: ВЫБОР ПРОДУКТА
+    # УДАЛЕНИЕ: ВЫБОР РЕЖИМА
+
+    if step == "delete_mode":
+        answer = text.strip()
+
+        if answer not in ("1", "2"):
+            await send(
+                chat_id,
+                "❌ Выбери вариант:\n"
+                "1 — Один продукт\n"
+                "2 — Несколько продуктов"
+            )
+            return
+
+        rows = await get_user_products(user_id)
+
+        if not rows:
+            user_states.pop(user_id, None)
+            await send(chat_id, "📦 Корзина уже пуста.")
+            return
+
+        if answer == "1":
+            state["step"] = "delete_number"
+
+            await send(
+                chat_id,
+                "🗑 Отправь номер одного продукта, "
+                "который нужно удалить."
+            )
+        else:
+            state["step"] = "delete_multiple_numbers"
+
+            await send(
+                chat_id,
+                "🗑 Введи номера продуктов через запятую.\n\n"
+                "Например: 1, 3, 5\n\n"
+                f"Сейчас в корзине продуктов: {len(rows)}\n\n"
+                "Для отмены: /cancel"
+            )
+
+        return
+
+    # УДАЛЕНИЕ: ВЫБОР ОДНОГО ПРОДУКТА
 
     if step == "delete_number":
         rows = await get_user_products(user_id)
@@ -1505,7 +1562,122 @@ async def handle_text(chat_id, user_id, text):
         )
         return
 
-    # УДАЛЕНИЕ: ПОДТВЕРЖДЕНИЕ
+    # УДАЛЕНИЕ: ВЫБОР НЕСКОЛЬКИХ ПРОДУКТОВ
+
+    if step == "delete_multiple_numbers":
+        rows = await get_user_products(user_id)
+
+        if not rows:
+            user_states.pop(user_id, None)
+            await send(chat_id, "📦 Корзина уже пуста.")
+            return
+
+        parts = re.split(r"[,;\s]+", text.strip())
+
+        if not parts or any(not part.isdigit() for part in parts):
+            await send(
+                chat_id,
+                "❌ Введи только номера через запятую.\n\n"
+                "Например: 1, 3, 5"
+            )
+            return
+
+        numbers = sorted(set(int(part) for part in parts))
+
+        if any(number < 1 or number > len(rows) for number in numbers):
+            await send(
+                chat_id,
+                f"❌ Номера должны быть от 1 до {len(rows)}."
+            )
+            return
+
+        selected_rows = [
+            rows[number - 1]
+            for number in numbers
+        ]
+
+        state["product_ids"] = [
+            row["id"]
+            for row in selected_rows
+        ]
+
+        state["product_names"] = [
+            row["name"]
+            for row in selected_rows
+        ]
+
+        state["step"] = "delete_multiple_confirm"
+
+        lines = [
+            "🗑 Будут удалены следующие продукты:",
+            ""
+        ]
+
+        for number, row in zip(numbers, selected_rows):
+            lines.append(
+                f"{number}. {product_emoji(row['name'])} "
+                f"{row['name']} — "
+                f"{row['expiry_date'].strftime('%d.%m.%Y')}"
+            )
+
+        lines.extend([
+            "",
+            f"Всего выбрано: {len(selected_rows)}",
+            "",
+            "Точно удалить выбранные продукты?",
+            "",
+            "1 — Да, удалить",
+            "2 — Нет, отменить"
+        ])
+
+        await send(chat_id, "\n".join(lines))
+        return
+
+    # УДАЛЕНИЕ: ПОДТВЕРЖДЕНИЕ НЕСКОЛЬКИХ ПРОДУКТОВ
+
+    if step == "delete_multiple_confirm":
+        answer = text.strip().casefold()
+
+        if answer in ("1", "да", "удалить"):
+            result = await db.execute("""
+                DELETE FROM products
+                WHERE id = ANY($1::BIGINT[])
+                AND user_id = $2
+            """, state["product_ids"], user_id)
+
+            deleted_count = int(
+                result.split()[-1]
+            )
+
+            user_states.pop(user_id, None)
+
+            await send(
+                chat_id,
+                f"✅ Удаление завершено!\n\n"
+                f"🗑 Удалено продуктов: {deleted_count}\n\n"
+                "Посмотреть оставшиеся продукты: /list"
+            )
+
+        elif answer in ("2", "нет", "отмена"):
+            user_states.pop(user_id, None)
+
+            await send(
+                chat_id,
+                "↩️ Массовое удаление отменено.\n\n"
+                "Все продукты остались в корзине."
+            )
+
+        else:
+            await send(
+                chat_id,
+                "Выбери один вариант:\n"
+                "1 — Да, удалить\n"
+                "2 — Нет, отменить"
+            )
+
+        return
+
+    # УДАЛЕНИЕ: ПОДТВЕРЖДЕНИЕ ОДНОГО ПРОДУКТА
 
     if step == "delete_confirm":
         answer = text.strip().casefold()
