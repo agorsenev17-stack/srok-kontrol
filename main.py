@@ -330,6 +330,7 @@ def find_additives(text):
     original_text = normalize_search_text(text)
     code_text = normalize_e_codes(text)
 
+    # Ищем E-коды
     codes = re.findall(
         r"(?i)\bE\s*-?\s*\d{3,4}[a-z]?\b",
         code_text
@@ -347,6 +348,12 @@ def find_additives(text):
         if item and item not in found:
             found.append(item)
 
+    # Разбиваем распознанный текст на отдельные слова
+    original_words = set(
+        re.findall(r"[a-zа-яё0-9]+", original_text)
+    )
+
+    # Проверяем названия и синонимы
     for item in additives.values():
         if not isinstance(item, dict):
             continue
@@ -371,12 +378,24 @@ def find_additives(text):
             search_names.append(aliases)
 
         for search_name in search_names:
-            search_name = normalize_search_text(search_name)
+            normalized_name = normalize_search_text(
+                search_name
+            )
 
-            if len(search_name) < 4:
+            if len(normalized_name) < 4:
                 continue
 
-            if search_name in original_text:
+            name_words = re.findall(
+                r"[a-zа-яё0-9]+",
+                normalized_name
+            )
+
+            if not name_words:
+                continue
+
+            # Все слова названия должны присутствовать в тексте.
+            # Поэтому порядок слов больше не имеет значения.
+            if all(word in original_words for word in name_words):
                 if item not in found:
                     found.append(item)
 
@@ -738,6 +757,14 @@ async def handle_photo(chat_id, user_id, message):
     )
 
     try:
+        # Сообщаем пользователю, что фотография обрабатывается
+        await send(
+            chat_id,
+            "⏳ Пожалуйста, подождите, ваше фото обрабатывается.\n\n"
+            "Я загружаю изображение и распознаю состав. "
+            "Это может занять некоторое время."
+        )
+
         if not photos:
             await send(
                 chat_id,
