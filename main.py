@@ -36,7 +36,7 @@ BASE_URL = f"https://api.telegram.org/bot{TOKEN}"
 MAX_PHOTO_SIZE = 10 * 1024 * 1024
 MAX_IMAGE_PIXELS = 25_000_000
 
-OCR_TIMEOUT = 12
+OCR_TIMEOUT = 35
 OCR_LOCK = threading.Lock()
 
 TIMEZONE_OPTIONS = {
