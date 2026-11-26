@@ -6,19 +6,16 @@ import logging
 import io
 import asyncio
 import threading
-import pytesseract
 
-from PIL import (
-    Image,
-    ImageOps,
-    ImageEnhance
-)
 from pathlib import Path
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 import asyncpg
+import pytesseract
+
+from PIL import Image, ImageOps, ImageEnhance
 from aiohttp import web, ClientSession, ClientTimeout
 
 
@@ -35,38 +32,23 @@ BASE_URL = f"https://api.telegram.org/bot{TOKEN}"
 
 MAX_PHOTO_SIZE = 10 * 1024 * 1024
 MAX_IMAGE_PIXELS = 25_000_000
-
 OCR_TIMEOUT = 35
+
 OCR_LOCK = threading.Lock()
 
 TIMEZONE_OPTIONS = {
     "1": ("Калининград", "Europe/Kaliningrad"),
-    "2": (
-        "Москва, Санкт-Петербург, Воронеж, Краснодар, Ростов-на-Дону",
-        "Europe/Moscow"
-    ),
+    "2": ("Москва, Санкт-Петербург, Воронеж, Краснодар, Ростов-на-Дону", "Europe/Moscow"),
     "3": ("Самара, Ижевск, Ульяновск, Саратов", "Europe/Samara"),
-    "4": (
-        "Екатеринбург, Уфа, Пермь, Челябинск, Тюмень",
-        "Asia/Yekaterinburg"
-    ),
+    "4": ("Екатеринбург, Уфа, Пермь, Челябинск, Тюмень", "Asia/Yekaterinburg"),
     "5": ("Омск", "Asia/Omsk"),
-    "6": (
-        "Новосибирск, Барнаул, Томск, Кемерово",
-        "Asia/Novosibirsk"
-    ),
-    "7": (
-        "Красноярск, Абакан, Норильск, Кызыл",
-        "Asia/Krasnoyarsk"
-    ),
+    "6": ("Новосибирск, Барнаул, Томск, Кемерово", "Asia/Novosibirsk"),
+    "7": ("Красноярск, Абакан, Норильск, Кызыл", "Asia/Krasnoyarsk"),
     "8": ("Иркутск, Улан-Удэ", "Asia/Irkutsk"),
     "9": ("Якутск, Чита", "Asia/Yakutsk"),
     "10": ("Владивосток, Хабаровск, Биробиджан", "Asia/Vladivostok"),
     "11": ("Магадан, Южно-Сахалинск", "Asia/Magadan"),
-    "12": (
-        "Петропавловск-Камчатский, Анадырь",
-        "Asia/Kamchatka"
-    )
+    "12": ("Петропавловск-Камчатский, Анадырь", "Asia/Kamchatka")
 }
 
 logging.basicConfig(
@@ -83,16 +65,15 @@ user_states = {}
 additives = {}
 
 background_tasks = set()
-
 ocr_semaphore = asyncio.Semaphore(1)
 
 
 # ==================================================
-# ЭМОДЗИ ДЛЯ ПРОДУКТОВ
+# ЭМОДЗИ ПРОДУКТОВ
 # ==================================================
 
 def product_emoji(name):
-    name = name.casefold()
+    name = str(name).casefold()
 
     categories = [
         ("🥛", ["молоко", "кефир", "ряженка", "сливки"]),
@@ -154,7 +135,6 @@ async def telegram(method, data):
         return result
 
 
-
 async def send(chat_id, text, reply_markup=None):
     max_length = 3800
 
@@ -211,12 +191,23 @@ async def send(chat_id, text, reply_markup=None):
 # ЗАГРУЗКА СПРАВОЧНИКОВ
 # ==================================================
 
+def normalize_code(code):
+    code = str(code).strip().upper()
+    code = code.replace("Ё", "Е")
+    code = re.sub(r"[\s_-]+", "", code)
+
+    if code.isdigit():
+        code = "E" + code
+
+    return code
+
+
 def load_additives():
     global additives
 
     base_path = Path(__file__).parent
 
-    files = [
+    filenames = [
         "additives.json",
         "additives_extra.json",
         "flavourings.json"
@@ -224,7 +215,7 @@ def load_additives():
 
     combined = {}
 
-    for filename in files:
+    for filename in filenames:
         file_path = base_path / filename
 
         try:
@@ -233,7 +224,7 @@ def load_additives():
 
             if not isinstance(data, dict):
                 raise ValueError(
-                    f"Неверный формат файла {filename}"
+                    f"Файл {filename} должен содержать JSON-объект"
                 )
 
             loaded_count = 0
@@ -247,7 +238,7 @@ def load_additives():
                     )
                     continue
 
-                normalized_code = str(code).strip().upper()
+                normalized_code = normalize_code(code)
 
                 if normalized_code in combined:
                     logger.warning(
@@ -269,16 +260,10 @@ def load_additives():
             logger.warning("Файл не найден: %s", filename)
 
         except json.JSONDecodeError:
-            logger.exception(
-                "Ошибка JSON в файле %s",
-                filename
-            )
+            logger.exception("Ошибка JSON в файле %s", filename)
 
         except Exception:
-            logger.exception(
-                "Ошибка загрузки файла %s",
-                filename
-            )
+            logger.exception("Ошибка загрузки файла %s", filename)
 
     additives = combined
 
@@ -289,19 +274,20 @@ def load_additives():
 
 
 # ==================================================
-# НОРМАЛИЗАЦИЯ ТЕКСТА
+# НОРМАЛИЗАЦИЯ ПОИСКА
 # ==================================================
 
 def normalize_search_text(text):
     text = str(text).casefold()
     text = text.replace("ё", "е")
+    text = re.sub(r"[^a-zа-я0-9]+", " ", text)
     text = re.sub(r"\s+", " ", text)
 
     return text.strip()
 
 
 def normalize_e_codes(text):
-    return text.translate(str.maketrans({
+    return str(text).translate(str.maketrans({
         "Е": "E",
         "е": "e",
         "А": "A",
@@ -327,95 +313,160 @@ def normalize_e_codes(text):
     }))
 
 
+def values_to_list(value):
+    if value is None:
+        return []
+
+    if isinstance(value, str):
+        return [value]
+
+    if isinstance(value, (int, float)):
+        return [str(value)]
+
+    if isinstance(value, list):
+        return [
+            str(item)
+            for item in value
+            if isinstance(item, (str, int, float))
+        ]
+
+    return []
+
+
+def get_item_search_names(item):
+    names = []
+
+    for field in (
+        "name",
+        "aliases",
+        "synonyms",
+        "english_name",
+        "scientific_name"
+    ):
+        names.extend(values_to_list(item.get(field)))
+
+    return names
+
+
+def get_item_identifiers(item):
+    identifiers = []
+
+    for field in (
+        "e_number",
+        "e_code",
+        "ins",
+        "ins_number",
+        "cas",
+        "cas_number",
+        "identifier"
+    ):
+        identifiers.extend(values_to_list(item.get(field)))
+
+    extra = item.get("identifiers")
+
+    if isinstance(extra, dict):
+        for value in extra.values():
+            identifiers.extend(values_to_list(value))
+
+    elif isinstance(extra, list):
+        identifiers.extend(values_to_list(extra))
+
+    elif isinstance(extra, str):
+        identifiers.append(extra)
+
+    return identifiers
+
+
 # ==================================================
 # ПОИСК ДОБАВОК И АРОМАТИЗАТОРОВ
 # ==================================================
 
 def find_additives(text):
     found = []
+    found_ids = set()
+
+    def add_item(item):
+        item_id = id(item)
+
+        if item_id not in found_ids:
+            found.append(item)
+            found_ids.add(item_id)
 
     original_text = normalize_search_text(text)
     code_text = normalize_e_codes(text)
 
+    # Поиск E-кодов, например E325, E-621, E 100
     codes = re.findall(
         r"(?i)\bE\s*-?\s*\d{3,4}[a-z]?\b",
         code_text
     )
 
     for code in codes:
-        normalized = re.sub(
-            r"[\s-]",
-            "",
-            code
-        ).upper()
-
+        normalized = normalize_code(code)
         item = additives.get(normalized)
 
-        if item and item not in found:
-            found.append(item)
+        if item:
+            add_item(item)
 
-    original_words = set(
-        re.findall(r"[a-zа-яё0-9]+", original_text)
+    # Поиск INS, CAS и других идентификаторов
+    normalized_input = re.sub(
+        r"[^a-zа-я0-9]",
+        "",
+        normalize_e_codes(text).casefold()
     )
 
+    for key, item in additives.items():
+        if not isinstance(item, dict):
+            continue
+
+        identifiers = get_item_identifiers(item)
+        identifiers.append(key)
+
+        for identifier in identifiers:
+            normalized_identifier = re.sub(
+                r"[^a-zа-я0-9]",
+                "",
+                normalize_e_codes(identifier).casefold()
+            )
+
+            if len(normalized_identifier) < 3:
+                continue
+
+            if normalized_identifier in normalized_input:
+                add_item(item)
+                break
+
+    # Поиск названий, синонимов и английских названий
     for item in additives.values():
         if not isinstance(item, dict):
             continue
 
-        search_names = []
+        for search_name in get_item_search_names(item):
+            normalized_name = normalize_search_text(search_name)
 
-        name = item.get("name", "")
-
-        if isinstance(name, str) and name:
-            search_names.append(name)
-
-        aliases = item.get("aliases", [])
-
-        if isinstance(aliases, list):
-            search_names.extend(
-                alias
-                for alias in aliases
-                if isinstance(alias, str)
-            )
-
-        elif isinstance(aliases, str):
-            search_names.append(aliases)
-
-        for search_name in search_names:
-            normalized_name = normalize_search_text(
-                search_name
-            )
-
-            if len(normalized_name) < 4:
+            if len(normalized_name) < 3:
                 continue
 
-            name_words = re.findall(
-                r"[a-zа-яё0-9]+",
-                normalized_name
-            )
+            # Многословные названия ищем как фразу.
+            # Пробелы допускают разные знаки препинания.
+            escaped = re.escape(normalized_name)
+            pattern = r"(?<![a-zа-я0-9])" + escaped.replace(
+                r"\ ",
+                r"\s+"
+            ) + r"(?![a-zа-я0-9])"
 
-            if not name_words:
-                continue
-
-            if all(word in original_words for word in name_words):
-                if item not in found:
-                    found.append(item)
-
+            if re.search(pattern, original_text):
+                add_item(item)
                 break
 
     return found
 
 
 # ==================================================
-# ПОДГОТОВКА ИЗОБРАЖЕНИЯ ДЛЯ OCR
+# ПОДГОТОВКА ФОТО ДЛЯ OCR
 # ==================================================
 
 def prepare_ocr_images(image_data):
-    """
-    Готовит три варианта фотографии:
-    контрастный, чёрно-белый и инвертированный.
-    """
-
     with Image.open(io.BytesIO(image_data)) as original:
         image = ImageOps.exif_transpose(original)
 
@@ -565,20 +616,15 @@ def choose_best_ocr(candidates):
 
 
 # ==================================================
-# ПРОВЕРКА ДОСТУПНОСТИ TESSERACT
+# ПРОВЕРКА TESSERACT
 # ==================================================
 
 def check_ocr_environment():
     try:
         version = pytesseract.get_tesseract_version()
-
         languages = pytesseract.get_languages(config="")
 
-        logger.info(
-            "Tesseract version: %s",
-            version
-        )
-
+        logger.info("Tesseract version: %s", version)
         logger.info(
             "Доступные языки OCR: %s",
             ", ".join(languages)
@@ -596,38 +642,34 @@ def check_ocr_environment():
                 ", ".join(missing)
             )
         else:
-            logger.info(
-                "Русский и английский OCR доступны"
-            )
+            logger.info("Русский и английский OCR доступны")
 
     except Exception:
-        logger.exception(
-            "Не удалось проверить окружение Tesseract"
-        )
+        logger.exception("Не удалось проверить окружение Tesseract")
 
 
 # ==================================================
-# АНАЛИЗ ДОБАВОК
+# ВЫВОД РЕЗУЛЬТАТОВ ПОИСКА
 # ==================================================
 
 async def check_additives(chat_id, text, photo_text=None):
     found = find_additives(text)
 
+    lines = []
+
+    if photo_text is not None:
+        lines.extend([
+            "📸 Фотография обработана!",
+            "",
+            "📝 Распознанный текст:",
+            photo_text[:1200] if photo_text else
+            "Не удалось уверенно распознать текст.",
+            "",
+            "🔬 Результат проверки:",
+            ""
+        ])
+
     if not found:
-        lines = []
-
-        if photo_text is not None:
-            lines.extend([
-                "📸 Фотография обработана!",
-                "",
-                "📝 Распознанный текст:",
-                photo_text[:1200] if photo_text else
-                "Не удалось уверенно распознать текст.",
-                "",
-                "🔬 Результат проверки:",
-                ""
-            ])
-
         lines.extend([
             "🔎 В нашем справочнике пока не найдены "
             "известные добавки из этого текста.",
@@ -651,43 +693,12 @@ async def check_additives(chat_id, text, photo_text=None):
         await send(chat_id, "\n".join(lines))
         return
 
-    lines = []
-
-    if photo_text is not None:
-        lines.extend([
-            "📸 Фотография обработана!",
-            "",
-            "📝 Распознанный текст:",
-            photo_text[:1200] if photo_text else
-            "Не удалось уверенно распознать текст.",
-            "",
-            "🔬 Результат проверки:",
-            ""
-        ])
-
     lines.extend([
         f"🔬 Найдено записей: {len(found)}",
         ""
     ])
 
     for item in found[:10]:
-        status = str(
-            item.get("status", "yellow")
-        ).lower()
-
-        if status == "green":
-            mark = "🟢"
-            label = (
-                "Нет оснований для опасений "
-                "при оценённых условиях применения"
-            )
-        elif status == "red":
-            mark = "🔴"
-            label = "Требует особого внимания"
-        else:
-            mark = "🟡"
-            label = "Есть особенности или ограничения"
-
         name = item.get("name", "Неизвестное вещество")
         category = item.get("category", "Не указана")
         purpose = item.get("purpose", "Информация отсутствует")
@@ -704,9 +715,8 @@ async def check_additives(chat_id, text, photo_text=None):
         source = item.get("source", "Источник не указан")
 
         lines.extend([
-            f"{mark} {name}",
+            f"🔬 {name}",
             f"Категория: {category}",
-            f"Оценка: {label}",
             "",
             f"🎯 Назначение:\n{purpose}",
             "",
@@ -716,7 +726,7 @@ async def check_additives(chat_id, text, photo_text=None):
             "",
             f"🧬 Воздействие:\n{effects}",
             "",
-            f"👤 Кому стоит обратить внимание:\n{who}",
+            f"👤 Кому стоит обратить внимание:\n{who}"
         ])
 
         if assessment:
@@ -873,10 +883,7 @@ async def handle_photo(chat_id, user_id, message):
             )
             return
 
-        logger.info(
-            "Фото скачано: %s байт",
-            len(image_data)
-        )
+        logger.info("Фото скачано: %s байт", len(image_data))
 
         try:
             async with ocr_semaphore:
@@ -896,7 +903,6 @@ async def handle_photo(chat_id, user_id, message):
                 chat_id,
                 "⚠️ Фотография получена, но произошла "
                 "техническая ошибка распознавания.\n\n"
-                "Это не означает, что снимок плохой. "
                 "Попробуй повторить проверку немного позже."
             )
             return
@@ -1097,9 +1103,8 @@ async def cleanup(app):
 
 
 # ==================================================
-# СТАРТ
+# СТАРТОВОЕ МЕНЮ
 # ==================================================
-
 
 async def start(chat_id):
     keyboard = {
@@ -1135,7 +1140,6 @@ async def start(chat_id):
     )
 
 
-
 # ==================================================
 # ЧАСОВОЙ ПОЯС
 # ==================================================
@@ -1166,7 +1170,7 @@ async def start_timezone(chat_id, user_id):
 
 
 # ==================================================
-# ПОЛУЧЕНИЕ ПРОДУКТОВ ПОЛЬЗОВАТЕЛЯ
+# ПОЛУЧЕНИЕ ПРОДУКТОВ
 # ==================================================
 
 async def get_user_products(user_id):
@@ -1206,7 +1210,7 @@ async def add_product(chat_id, user_id):
 
 
 # ==================================================
-# ПРОСМОТР КОРЗИНЫ
+# ПРОСМОТР ПРОДУКТОВ
 # ==================================================
 
 async def show_products(chat_id, user_id):
@@ -1266,7 +1270,7 @@ async def show_products(chat_id, user_id):
 
 
 # ==================================================
-# УДАЛЕНИЕ ПРОДУКТА
+# УДАЛЕНИЕ ПРОДУКТОВ
 # ==================================================
 
 async def start_delete(chat_id, user_id):
@@ -1291,10 +1295,9 @@ async def start_delete(chat_id, user_id):
     ]
 
     for index, row in enumerate(rows, 1):
-        emoji = product_emoji(row["name"])
-
         lines.append(
-            f"{index}. {emoji} {row['name']} — "
+            f"{index}. {product_emoji(row['name'])} "
+            f"{row['name']} — "
             f"{row['expiry_date'].strftime('%d.%m.%Y')}"
         )
 
@@ -1312,7 +1315,7 @@ async def start_delete(chat_id, user_id):
 
 
 # ==================================================
-# РЕДАКТИРОВАНИЕ ПРОДУКТА
+# РЕДАКТИРОВАНИЕ ПРОДУКТОВ
 # ==================================================
 
 async def start_edit(chat_id, user_id):
@@ -1337,10 +1340,9 @@ async def start_edit(chat_id, user_id):
     ]
 
     for index, row in enumerate(rows, 1):
-        emoji = product_emoji(row["name"])
-
         lines.append(
-            f"{index}. {emoji} {row['name']} — "
+            f"{index}. {product_emoji(row['name'])} "
+            f"{row['name']} — "
             f"{row['expiry_date'].strftime('%d.%m.%Y')}"
         )
 
@@ -1366,7 +1368,7 @@ async def handle_text(chat_id, user_id, text):
 
     step = state.get("step")
 
-    # ВЫБОР ЧАСОВОГО ПОЯСА
+    # ЧАСОВОЙ ПОЯС
 
     if step == "timezone_choice":
         choice = text.strip()
@@ -1388,6 +1390,7 @@ async def handle_text(chat_id, user_id, text):
                 "Некорректный часовой пояс: %s",
                 timezone
             )
+
             await send(
                 chat_id,
                 "⚠️ Не удалось установить часовой пояс. "
@@ -1434,11 +1437,9 @@ async def handle_text(chat_id, user_id, text):
         state["name"] = name
         state["step"] = "date"
 
-        emoji = product_emoji(name)
-
         await send(
             chat_id,
-            f"{emoji} Продукт: {name}\n\n"
+            f"{product_emoji(name)} Продукт: {name}\n\n"
             "📅 Теперь введи дату окончания "
             "срока годности.\n\n"
             "Например: 25.12.2026"
@@ -1478,8 +1479,6 @@ async def handle_text(chat_id, user_id, text):
             expiry - date.today()
         ).days
 
-        emoji = product_emoji(name)
-
         if remaining < 0:
             status = (
                 "⚠️ Указанная дата уже прошла.\n"
@@ -1499,7 +1498,7 @@ async def handle_text(chat_id, user_id, text):
         await send(
             chat_id,
             f"✅ Продукт добавлен!\n\n"
-            f"{emoji} {name}\n"
+            f"{product_emoji(name)} {name}\n"
             f"📅 Годен до: "
             f"{expiry.strftime('%d.%m.%Y')}\n\n"
             f"{status}\n\n"
@@ -1549,7 +1548,7 @@ async def handle_text(chat_id, user_id, text):
 
         return
 
-    # УДАЛЕНИЕ: ВЫБОР ОДНОГО ПРОДУКТА
+    # УДАЛЕНИЕ: ОДИН ПРОДУКТ
 
     if step == "delete_number":
         rows = await get_user_products(user_id)
@@ -1587,7 +1586,7 @@ async def handle_text(chat_id, user_id, text):
         )
         return
 
-    # УДАЛЕНИЕ: ВЫБОР НЕСКОЛЬКИХ ПРОДУКТОВ
+    # УДАЛЕНИЕ: НЕСКОЛЬКО ПРОДУКТОВ
 
     if step == "delete_multiple_numbers":
         rows = await get_user_products(user_id)
@@ -1626,11 +1625,6 @@ async def handle_text(chat_id, user_id, text):
             for row in selected_rows
         ]
 
-        state["product_names"] = [
-            row["name"]
-            for row in selected_rows
-        ]
-
         state["step"] = "delete_multiple_confirm"
 
         lines = [
@@ -1658,7 +1652,7 @@ async def handle_text(chat_id, user_id, text):
         await send(chat_id, "\n".join(lines))
         return
 
-    # УДАЛЕНИЕ: ПОДТВЕРЖДЕНИЕ НЕСКОЛЬКИХ ПРОДУКТОВ
+    # ПОДТВЕРЖДЕНИЕ МАССОВОГО УДАЛЕНИЯ
 
     if step == "delete_multiple_confirm":
         answer = text.strip().casefold()
@@ -1670,9 +1664,7 @@ async def handle_text(chat_id, user_id, text):
                 AND user_id = $2
             """, state["product_ids"], user_id)
 
-            deleted_count = int(
-                result.split()[-1]
-            )
+            deleted_count = int(result.split()[-1])
 
             user_states.pop(user_id, None)
 
@@ -1702,7 +1694,7 @@ async def handle_text(chat_id, user_id, text):
 
         return
 
-    # УДАЛЕНИЕ: ПОДТВЕРЖДЕНИЕ ОДНОГО ПРОДУКТА
+    # ПОДТВЕРЖДЕНИЕ УДАЛЕНИЯ ОДНОГО ПРОДУКТА
 
     if step == "delete_confirm":
         answer = text.strip().casefold()
@@ -1738,6 +1730,7 @@ async def handle_text(chat_id, user_id, text):
                 "↩️ Удаление отменено. "
                 "Продукт остался в корзине."
             )
+
         else:
             await send(
                 chat_id,
@@ -1809,6 +1802,7 @@ async def handle_text(chat_id, user_id, text):
                 "Формат: ДД.ММ.ГГГГ\n"
                 "Например: 25.12.2026"
             )
+
         else:
             await send(
                 chat_id,
@@ -1907,7 +1901,61 @@ async def handle_text(chat_id, user_id, text):
 
 
 # ==================================================
-# ПОЛУЧЕНИЕ СООБЩЕНИЙ TELEGRAM
+# ОБРАБОТКА КОМАНД
+# ==================================================
+
+async def handle_command(chat_id, user_id, command):
+    command = command.split()[0].split("@")[0]
+
+    if command == "/start":
+        user_states.pop(user_id, None)
+        await start(chat_id)
+
+    elif command == "/add":
+        await add_product(chat_id, user_id)
+
+    elif command == "/list":
+        await show_products(chat_id, user_id)
+
+    elif command == "/delete":
+        await start_delete(chat_id, user_id)
+
+    elif command == "/edit":
+        await start_edit(chat_id, user_id)
+
+    elif command == "/timezone":
+        await start_timezone(chat_id, user_id)
+
+    elif command == "/cancel":
+        user_states.pop(user_id, None)
+
+        await send(
+            chat_id,
+            "❌ Текущее действие отменено."
+        )
+
+    elif command == "/help":
+        await send(
+            chat_id,
+            "📖 Помощь\n\n"
+            "/start — запуск бота\n"
+            "/add — добавить продукт\n"
+            "/list — посмотреть продукты\n"
+            "/edit — изменить продукт\n"
+            "/delete — удалить продукт\n"
+            "/timezone — выбрать город и часовой пояс\n"
+            "/cancel — отменить действие\n"
+            "/help — помощь\n\n"
+            "🔬 Для проверки состава отправь "
+            "E325, E621, ванилин, ментол "
+            "или английское название вещества.\n\n"
+            "📸 Также можешь отправить фотографию "
+            "состава продукта для проверки."
+        )
+
+
+# ==================================================
+# ОБРАБОТКА СООБЩЕНИЙ TELEGRAM
 # ==================================================
 
 async def handle(request):
@@ -1918,7 +1966,6 @@ async def handle(request):
 
     try:
         update = await request.json()
-
         update_id = update.get("update_id")
 
         if update_id is not None:
@@ -1962,8 +2009,7 @@ async def handle(request):
         if not chat_id or not user_id:
             return web.json_response({"ok": True})
 
-        if not text and not message.get("photo"):
-            return web.json_response({"ok": True})
+        # ФОТОГРАФИЯ
 
         if message.get("photo"):
             logger.info(
@@ -1985,95 +2031,74 @@ async def handle(request):
 
             return web.json_response({"ok": True})
 
-        command = text.split()[0].split("@")[0]
+        # ПУСТОЕ СООБЩЕНИЕ
 
-        if command == "/start":
-            user_states.pop(user_id, None)
-            await start(chat_id)
+        if not text:
+            return web.json_response({"ok": True})
 
-        elif command == "/add":
-            await add_product(chat_id, user_id)
+        # КОМАНДЫ
 
-        elif command == "/list":
-            await show_products(chat_id, user_id)
-
-        elif command == "/delete":
-            await start_delete(chat_id, user_id)
-
-        elif command == "/edit":
-            await start_edit(chat_id, user_id)
-
-        elif command == "/timezone":
-            await start_timezone(chat_id, user_id)
-
-        elif command == "/cancel":
-            user_states.pop(user_id, None)
-
-            await send(
-                chat_id,
-                "❌ Текущее действие отменено."
-            )
-
-        elif command == "/help":
-            await send(
-                chat_id,
-                "📖 Помощь\n\n"
-                "/start — запуск бота\n"
-                "/add — добавить продукт\n"
-                "/list — посмотреть продукты\n"
-                "/edit — изменить продукт\n"
-                "/delete — удалить продукт\n"
-                "/timezone — выбрать город и часовой пояс\n"
-                "/cancel — отменить действие\n"
-                "/help — помощь\n\n"
-                "🔬 Для проверки состава отправь "
-                "E325, E621, ванилин, ментол "
-                "или английское название вещества.\n\n"
-                "📸 Также можешь отправить фотографию "
-                "состава продукта для проверки."
-            )
-
-        
-else:
-    menu_actions = {
-        "➕ Добавить продукт": "/add",
-        "📦 Мои продукты": "/list",
-        "✏️ Изменить продукт": "/edit",
-        "🗑 Удалить продукт": "/delete",
-        "⏰ Напоминания": "/timezone",
-        "🔬 Справочник": None,
-        "📸 Проверить состав": None,
-        "⚙️ Настройки": "/timezone"
-    }
-
-    if text in menu_actions:
-        action = menu_actions[text]
-
-        if action:
+        if text.startswith("/"):
             await handle_command(
                 chat_id,
                 user_id,
-                action
+                text
             )
-        elif text == "🔬 Справочник":
+
+            return web.json_response({"ok": True})
+
+        # КНОПКИ МЕНЮ
+
+        menu_actions = {
+            "➕ Добавить продукт": "/add",
+            "📦 Мои продукты": "/list",
+            "✏️ Изменить продукт": "/edit",
+            "🗑 Удалить продукт": "/delete",
+            "⏰ Напоминания": "/timezone",
+            "⚙️ Настройки": "/timezone"
+        }
+
+        if text in menu_actions:
+            await handle_command(
+                chat_id,
+                user_id,
+                menu_actions[text]
+            )
+
+            return web.json_response({"ok": True})
+
+        if text == "🔬 Справочник":
+            user_states.pop(user_id, None)
+
             await send(
                 chat_id,
                 "🔬 Справочник добавок\n\n"
                 "Отправь название вещества, "
-                "E-код или ароматизатор для поиска."
+                "E-код, INS, CAS или ароматизатор для поиска.\n\n"
+                "Например: E621, ванилин, ментол."
             )
-        elif text == "📸 Проверить состав":
+
+            return web.json_response({"ok": True})
+
+        if text == "📸 Проверить состав":
+            user_states.pop(user_id, None)
+
             await send(
                 chat_id,
-                "📸 Отправь фотографию состава продукта."
+                "📸 Отправь фотографию состава продукта.\n\n"
+                "Постарайся, чтобы текст на упаковке "
+                "был хорошо виден."
             )
-    else:
+
+            return web.json_response({"ok": True})
+
+        # ОБЫЧНЫЙ ТЕКСТ ИЛИ ПОИСК
+
         await handle_text(
             chat_id,
             user_id,
             text
         )
-
 
         return web.json_response({"ok": True})
 
@@ -2083,7 +2108,7 @@ else:
 
 
 # ==================================================
-# ПРОВЕРКА РАБОТОСПОСОБНОСТИ RENDER
+# ПРОВЕРКА RENDER
 # ==================================================
 
 async def health(request):
